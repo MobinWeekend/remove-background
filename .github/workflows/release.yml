@@ -1,0 +1,171 @@
+# Build and publish a GitHub release when the workspace version changes.
+#
+# - push to main touching Cargo.toml: releases only if [workspace.package] version
+#   differs from the previous commit AND tag v<version> doesn't exist yet.
+# - manual run (Actions -> Release -> Run workflow): builds the current version;
+#   publishes only when "publish" is checked (and the tag doesn't exist).
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths: [Cargo.toml]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish a GitHub release (otherwise build artifacts only)
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: Detect version change
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      build: ${{ steps.v.outputs.build }}
+      publish: ${{ steps.v.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: v
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          PUBLISH_INPUT: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+          ver() { sed -n '/^\[workspace\.package\]/,/^\[/{s/^version *= *"\([^"]*\)".*/\1/p}' "$1"; }
+          cur=$(ver Cargo.toml)
+          if ! [[ "$cur" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::could not read a semver [workspace.package] version from Cargo.toml (got '$cur')"; exit 1
+          fi
+          prev=""
+          if [[ -n "${BEFORE:-}" && ! "$BEFORE" =~ ^0+$ ]] && git cat-file -e "$BEFORE:Cargo.toml" 2>/dev/null; then
+            git show "$BEFORE:Cargo.toml" > /tmp/prev.toml && prev=$(ver /tmp/prev.toml)
+          fi
+          tag_exists=false
+          git ls-remote --exit-code --tags origin "refs/tags/v$cur" >/dev/null 2>&1 && tag_exists=true
+
+          build=false; publish=false
+          if [[ "$EVENT" == "workflow_dispatch" ]]; then
+            build=true
+            [[ "$PUBLISH_INPUT" == "true" && "$tag_exists" == "false" ]] && publish=true
+          elif [[ "$cur" != "$prev" && "$tag_exists" == "false" ]]; then
+            build=true; publish=true
+          fi
+          echo "version: ${prev:-<none>} -> $cur (tag v$cur exists: $tag_exists) => build=$build publish=$publish" | tee -a "$GITHUB_STEP_SUMMARY"
+          { echo "version=$cur"; echo "build=$build"; echo "publish=$publish"; } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (${{ matrix.variant }})
+    needs: version
+    if: needs.version.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - variant: cpu
+            features: ""
+            suffix: ""
+          - variant: cuda
+            features: --features rembg-cli/cuda
+            suffix: -cuda
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System dependencies
+        # libssl/pkg-config: ort's build script downloads ONNX Runtime over TLS.
+        # Everything GUI-related (X11, Wayland, fontconfig) is dlopen'ed at runtime.
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.variant }}
+
+      - name: Test
+        if: matrix.variant == 'cpu'
+        run: cargo test --workspace --locked
+
+      - name: Build
+        run: cargo build --release --locked ${{ matrix.features }}
+
+      - name: Package
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          VARIANT: ${{ matrix.variant }}
+          SUFFIX: ${{ matrix.suffix }}
+        run: |
+          set -euo pipefail
+          name="rembg-$VERSION-x86_64-linux$SUFFIX"
+          dir="dist/$name"
+          mkdir -p "$dir"
+          cp target/release/rembg README.md "$dir/"
+          if [[ "$VARIANT" == "cuda" ]]; then
+            # provider libs are symlinks into ort's download cache: copy the targets
+            cp -L target/release/libonnxruntime_providers_cuda.so \
+                  target/release/libonnxruntime_providers_shared.so "$dir/"
+            cp scripts/fetch-cuda-libs.sh "$dir/"
+            cat > "$dir/CUDA.txt" <<'EOF'
+          rembg CUDA build (ONNX Runtime 1.31 / CUDA 13)
+
+          Requires an NVIDIA driver >= 580 and an Ampere-or-newer GPU.
+
+          The CUDA runtime (cudart, cuBLAS, cuDNN, cuFFT, cuRAND, NVRTC; ~2 GB) is not
+          included. Fetch it once into ./lib next to the binary (needs python3):
+
+              ./fetch-cuda-libs.sh ./lib
+
+          rembg finds ./lib automatically. Without it, rembg runs on CPU.
+          Check with:  ./rembg info
+          EOF
+          fi
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+          ls -lh dist
+          echo "- \`$name.tar.gz\` ($(du -h "dist/$name.tar.gz" | cut -f1))" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rembg-${{ matrix.variant }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [version, build]
+    if: needs.version.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          ls -lh dist
+          gh release create "v$VERSION" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "rembg v$VERSION" \
+            --generate-notes

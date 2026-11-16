@@ -45,6 +45,18 @@ of the flag behind, while BiRefNet on the right removes it cleanly.
 > [scikit-image](https://github.com/scikit-image/scikit-image/tree/v0.19.3/skimage/data): astronaut (NASA),
 > Chelsea the cat (Stefan van der Walt), coffee (Rachel Michetti).
 
+## Install
+
+Download a release from [Releases](https://github.com/gohorsebr/rembg/releases) (Linux x86_64, glibc ≥ 2.39, e.g. Ubuntu 24.04+):
+
+- `rembg-<ver>-x86_64-linux.tar.gz`: CPU build, a single binary.
+- `rembg-<ver>-x86_64-linux-cuda.tar.gz`: CUDA build. After extracting, run `./fetch-cuda-libs.sh ./lib` once to
+  download the CUDA 13 runtime (~2 GB) next to the binary; see `CUDA.txt`.
+
+```sh
+tar xzf rembg-*-x86_64-linux.tar.gz && cd rembg-*/ && ./rembg gui
+```
+
 ## Models
 
 | id | family | input | size | licence |
@@ -111,6 +123,14 @@ make screenshots      # regenerate docs/screenshots (needs a display and the mod
 | `crates/core` (`rembg-core`) | headless engine: model registry, download/cache, pre/post-processing, ONNX Runtime inference, compositing, comparison grid. No UI deps. |
 | `crates/gui` (`rembg-gui`) | egui/eframe app. |
 | `crates/cli` (`rembg` binary) | `remove`, `compare`, `models`, `info`, `gui`. |
+
+### Releases
+
+`.github/workflows/release.yml` builds and publishes a release only when the version changes: bump
+`version` under `[workspace.package]` in `Cargo.toml` and push to `main`. It runs the tests, builds the CPU and CUDA
+variants, and creates the `v<version>` tag and release with both tarballs and sha256 files. Pushes that edit
+`Cargo.toml` without changing the version, or whose `v<version>` tag already exists, do nothing. A manual run
+(*Actions → Release → Run workflow*) builds artifacts only, unless *publish* is checked.
 
 ### GPU (CUDA)
 
