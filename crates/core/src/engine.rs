@@ -1,5 +1,6 @@
 //! ONNX Runtime inference: image -> alpha mask.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -66,6 +67,8 @@ pub struct Engine {
     max_loaded: usize,
     /// Why CUDA was not used (if it was requested/auto and failed).
     pub cuda_fallback_reason: Option<String>,
+    /// Models that failed at run time on CUDA (e.g. out of VRAM) and now run on CPU.
+    cpu_only: HashSet<&'static str>,
 }
 
 fn ort_err(e: impl fmt::Display) -> Error {
@@ -75,7 +78,14 @@ fn ort_err(e: impl fmt::Display) -> Error {
 impl Engine {
     pub fn new(pref: DevicePref) -> Result<Self> {
         let env = ort::environment::init().with_name("rembg").build().map_err(ort_err)?;
-        Ok(Self { env, pref, loaded: Vec::new(), max_loaded: 2, cuda_fallback_reason: None })
+        Ok(Self {
+            env,
+            pref,
+            loaded: Vec::new(),
+            max_loaded: 2,
+            cuda_fallback_reason: None,
+            cpu_only: HashSet::new(),
+        })
     }
 
     /// Whether this binary was built with the CUDA execution provider.
@@ -93,6 +103,7 @@ impl Engine {
             self.pref = pref;
             self.unload_all();
             self.cuda_fallback_reason = None;
+            self.cpu_only.clear();
         }
     }
 
@@ -125,9 +136,15 @@ impl Engine {
         if cuda {
             #[cfg(feature = "cuda")]
             {
-                b = b
-                    .with_execution_providers([ort::ep::CUDA::default().build().error_on_failure()])
-                    .map_err(ort_err)?;
+                use ort::ep::{ArenaExtendStrategy, CUDA, cuda::ConvAlgorithmSearch};
+                // Conservative memory settings so 1024² BiRefNet fits on 6-8 GB laptop GPUs.
+                let ep = CUDA::default()
+                    .with_arena_extend_strategy(ArenaExtendStrategy::SameAsRequested)
+                    .with_conv_max_workspace(false)
+                    .with_conv_algorithm_search(ConvAlgorithmSearch::Heuristic)
+                    .build()
+                    .error_on_failure();
+                b = b.with_execution_providers([ep]).map_err(ort_err)?;
             }
             #[cfg(not(feature = "cuda"))]
             return Err(Error::Other("built without CUDA support (rebuild with --features cuda)".into()));
@@ -155,7 +172,7 @@ impl Engine {
             DevicePref::Cpu => false,
             DevicePref::Cuda => true,
             DevicePref::Auto => Self::cuda_compiled() && self.cuda_fallback_reason.is_none(),
-        };
+        } && !self.cpu_only.contains(spec.id);
         let (session, device) = if want_cuda {
             match self.build_session(path, true) {
                 Ok(s) => (s, ActiveDevice::Cuda),
@@ -180,14 +197,49 @@ impl Engine {
         model_path: &Path,
         img: &DynamicImage,
     ) -> Result<Prediction> {
-        let load_time = self.ensure_loaded(spec, model_path)?;
+        let mut load_time = self.ensure_loaded(spec, model_path)?;
         let t = Instant::now();
         let input = preprocess(spec, img)?;
+        let mut device = self.loaded.last().expect("just loaded").device;
+        let mut result = self.infer(spec, input.clone());
+
+        // CUDA run-time failure (typically out of VRAM): free other sessions and
+        // retry on the GPU, then fall back to CPU for this model.
+        if let Err(e) = &result
+            && device == ActiveDevice::Cuda
+            && self.pref == DevicePref::Auto
+        {
+            tracing::warn!("{} failed on CUDA: {e}", spec.id);
+            if self.loaded.len() > 1 {
+                let cur = self.loaded.pop().expect("loaded");
+                self.loaded.clear();
+                self.loaded.push(cur);
+                result = self.infer(spec, input.clone());
+            }
+            if result.is_err() {
+                tracing::warn!("running {} on CPU instead", spec.id);
+                self.loaded.retain(|l| l.id != spec.id);
+                self.cpu_only.insert(spec.id);
+                let lt = self.ensure_loaded(spec, model_path)?;
+                load_time = Some(load_time.unwrap_or_default() + lt.unwrap_or_default());
+                device = ActiveDevice::Cpu;
+                result = self.infer(spec, input);
+            }
+        }
+        let small = result?;
+
+        let mask = imageops::resize_gray(&small, img.width(), img.height())?;
+        Ok(Prediction { model: spec.id, mask, device, infer_time: t.elapsed(), load_time })
+    }
+}
+
+impl Engine {
+    /// Run the most recently loaded session (must be `spec`'s) on preprocessed input.
+    fn infer(&mut self, spec: &ModelSpec, input: Vec<f32>) -> Result<GrayImage> {
         let s = spec.pre.size as usize;
         let tensor = Tensor::from_array(([1usize, 3, s, s], input)).map_err(ort_err)?;
-
-        let loaded = self.loaded.last_mut().expect("just loaded");
-        let device = loaded.device;
+        let loaded = self.loaded.last_mut().expect("loaded");
+        debug_assert_eq!(loaded.id, spec.id);
         let outputs = loaded.session.run(ort::inputs![tensor]).map_err(ort_err)?;
         let (shape, data) = outputs[0].try_extract_tensor::<f32>().map_err(ort_err)?;
         let dims: Vec<i64> = shape.iter().copied().collect();
@@ -195,12 +247,7 @@ impl Engine {
             return Err(Error::Other(format!("unexpected output shape {dims:?}")));
         }
         let (oh, ow) = (dims[dims.len() - 2] as u32, dims[dims.len() - 1] as u32);
-        let plane = &data[..(oh * ow) as usize];
-        let small = postprocess(spec, plane, ow, oh);
-        drop(outputs);
-
-        let mask = imageops::resize_gray(&small, img.width(), img.height())?;
-        Ok(Prediction { model: spec.id, mask, device, infer_time: t.elapsed(), load_time })
+        Ok(postprocess(spec, &data[..(oh * ow) as usize], ow, oh))
     }
 }
 
