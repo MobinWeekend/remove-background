@@ -149,11 +149,11 @@ jobs:
           Requires an NVIDIA driver >= 580 and an Ampere-or-newer GPU.
 
           The CUDA runtime (cudart, cuBLAS, cuDNN, cuFFT, cuRAND, NVRTC; ~2 GB) is not
-          included. Fetch it once into ./lib next to the binary (needs python3):
+          included. Fetch it once (needs python3); it goes into lib/ next to the binary:
 
-              ./fetch-cuda-libs.sh ./lib
+              ./fetch-cuda-libs.sh
 
-          rembg finds ./lib automatically. Without it, rembg runs on CPU.
+          rembg finds lib/ automatically, wherever it is run from. Without it, rembg runs on CPU.
           Check with:  ./rembg info
           EOF
               fi

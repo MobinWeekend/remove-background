@@ -55,7 +55,7 @@ Download a release from [Releases](https://github.com/gohorsebr/rembg/releases).
 |---|---|---|
 | `rembg-<ver>-x86_64-windows.zip` | Windows 10/11 x64 | DirectML (NVIDIA, AMD, Intel), else CPU |
 | `rembg-<ver>-x86_64-linux.tar.gz` | Linux x86_64, glibc ≥ 2.39 (Ubuntu 24.04+) | CPU |
-| `rembg-<ver>-x86_64-linux-cuda.tar.gz` | same | CUDA 13: run `./fetch-cuda-libs.sh ./lib` once (~2 GB), see `CUDA.txt` |
+| `rembg-<ver>-x86_64-linux-cuda.tar.gz` | same | CUDA 13: run `./fetch-cuda-libs.sh` once (~2 GB), see `CUDA.txt` |
 
 **Windows**: unzip anywhere and double-click `rembg-gui.exe` (no console window), or run `rembg.exe` from a terminal.
 Models are stored in `%LOCALAPPDATA%\rembg\models`.

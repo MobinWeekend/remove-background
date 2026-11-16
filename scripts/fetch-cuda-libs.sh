@@ -1,15 +1,29 @@
 #!/usr/bin/env bash
-# Bundle the CUDA 13 runtime libraries needed by ONNX Runtime's CUDA EP into DEST
-# (default target/release/lib), taken from NVIDIA's redistributable PyPI wheels.
+# Bundle the CUDA 13 runtime libraries needed by ONNX Runtime's CUDA EP into DEST,
+# taken from NVIDIA's redistributable PyPI wheels.
+#
+#   fetch-cuda-libs.sh [DEST]
+#
+# Default DEST: in a release archive (script next to the `rembg` binary), the
+# `lib/` directory beside the binary; in a source checkout, target/release/lib.
+# rembg adds `<exe dir>/lib` to the library path itself.
 #
 # CUDA_SERIES pins toolkit-versioned packages to a minor series compatible with
 # the oldest driver you target (13.0 => driver >= 580). Wheels are cached in
 # ~/.cache/rembg/wheels.
 set -euo pipefail
-DEST="${1:-target/release/lib}"
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -e "$here/rembg" ]]; then
+  default="$here/lib"
+else
+  default="$(dirname "$here")/target/release/lib"
+fi
+DEST="${1:-$default}"
 CUDA_SERIES="${CUDA_SERIES:-13.0}"
 CACHE="${HOME}/.cache/rembg/wheels"
 mkdir -p "$DEST" "$CACHE"
+DEST="$(cd "$DEST" && pwd)"
+echo "CUDA ${CUDA_SERIES} runtime -> $DEST"
 
 python3 -I - "$DEST" "$CACHE" "$CUDA_SERIES" <<'PY'
 import json, os, sys, urllib.request, zipfile, hashlib
@@ -52,3 +66,6 @@ for name, prefix in pkgs:
     print(f"{name:22} {ver:14} {n} libs")
 PY
 du -sh "$DEST"
+if [[ -e "$here/rembg" ]]; then
+  echo "check with: $here/rembg info"
+fi
