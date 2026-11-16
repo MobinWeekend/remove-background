@@ -7,3 +7,10 @@ license.workspace = true
 [dependencies]
 rembg-core.workspace = true
 anyhow.workspace = true
+eframe.workspace = true
+egui.workspace = true
+image.workspace = true
+crossbeam-channel.workspace = true
+arboard.workspace = true
+rfd.workspace = true
+tracing.workspace = true

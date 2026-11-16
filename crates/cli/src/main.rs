@@ -49,6 +49,9 @@ enum Cmd {
     Gui {
         /// Image to open
         image: Option<PathBuf>,
+        /// Tab to start on
+        #[arg(long, value_enum, default_value_t = GuiTab::Remove)]
+        tab: GuiTab,
     },
     /// Show runtime / device info
     Info,
@@ -127,6 +130,13 @@ enum ModelsCmd {
     Path,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum GuiTab {
+    Remove,
+    Compare,
+    Models,
+}
+
 #[derive(Clone, Copy, ValueEnum, PartialEq)]
 enum Fmt {
     Png,
@@ -144,7 +154,30 @@ impl Fmt {
     }
 }
 
+/// CUDA builds ship the CUDA runtime in `<exe dir>/lib`. The CUDA EP and cuDNN
+/// resolve those by soname (incl. cuDNN's own dlopen of its sub-libraries), so
+/// re-exec once with that directory on LD_LIBRARY_PATH.
+#[cfg(all(feature = "cuda", target_os = "linux"))]
+fn ensure_cuda_lib_path() {
+    use std::os::unix::process::CommandExt;
+    let Ok(exe) = std::env::current_exe() else { return };
+    let Some(dir) = exe.parent().map(|d| d.join("lib")).filter(|d| d.is_dir()) else { return };
+    let cur = std::env::var_os("LD_LIBRARY_PATH").unwrap_or_default();
+    if std::env::split_paths(&cur).any(|p| p == dir) {
+        return;
+    }
+    let paths = std::iter::once(dir).chain(std::env::split_paths(&cur));
+    let Ok(joined) = std::env::join_paths(paths) else { return };
+    let err = std::process::Command::new(&exe)
+        .args(std::env::args_os().skip(1))
+        .env("LD_LIBRARY_PATH", joined)
+        .exec();
+    eprintln!("warning: could not re-exec with bundled CUDA libs: {err}");
+}
+
 fn main() -> Result<()> {
+    #[cfg(all(feature = "cuda", target_os = "linux"))]
+    ensure_cuda_lib_path();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn,ort=error".into()),
@@ -157,7 +190,15 @@ fn main() -> Result<()> {
         Cmd::Remove(a) => remove(&store, cli.device.into(), a),
         Cmd::Compare(a) => compare(&store, cli.device.into(), a),
         Cmd::Models(m) => models(&store, m),
-        Cmd::Gui { image } => rembg_gui::run(image, cli.device.into()),
+        Cmd::Gui { image, tab } => rembg_gui::run(
+            image,
+            cli.device.into(),
+            match tab {
+                GuiTab::Remove => rembg_gui::StartTab::Remove,
+                GuiTab::Compare => rembg_gui::StartTab::Compare,
+                GuiTab::Models => rembg_gui::StartTab::Models,
+            },
+        ),
         Cmd::Info => info(&store, cli.device.into()),
         Cmd::ServeClipboard { png } => serve_clipboard(&png),
     }
