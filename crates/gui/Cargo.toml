@@ -1,0 +1,8 @@
+[package]
+name = "rembg-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rembg-core.workspace = true

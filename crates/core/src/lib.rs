@@ -1,0 +1,1 @@
+//! Headless background-removal engine.

@@ -1,0 +1,13 @@
+[package]
+name = "rembg-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rembg"
+path = "src/main.rs"
+
+[dependencies]
+rembg-core.workspace = true
+rembg-gui.workspace = true

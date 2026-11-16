@@ -1,0 +1,40 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/gui", "crates/cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+rembg-core = { path = "crates/core" }
+rembg-gui = { path = "crates/gui" }
+anyhow = "1"
+thiserror = "2"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "bmp", "tiff", "gif"] }
+fast_image_resize = { version = "6", features = ["image"] }
+ort = { version = "=2.0.0-rc.15" }
+ndarray = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+dirs = "7"
+ureq = "3"
+crossbeam-channel = "0.5"
+clap = { version = "4", features = ["derive"] }
+indicatif = "0.18"
+eframe = "0.37"
+egui = "0.37"
+arboard = { version = "3", features = ["wayland-data-control"] }
+rfd = "0.18"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = true
+
+[profile.dev.package."*"]
+opt-level = 2
