@@ -37,6 +37,9 @@ pub fn run(image: Option<PathBuf>, device: DevicePref, start: StartTab) -> anyho
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([640.0, 420.0])
             .with_drag_and_drop(true),
+        // Deliver Ctrl+C / Ctrl+V as plain key events: we handle image clipboard
+        // ourselves (egui's own translation only covers text).
+        clipboard_shortcuts: false,
         ..Default::default()
     };
     eframe::run_native(
@@ -460,21 +463,30 @@ impl App {
                 i.consume_shortcut(&sc(Modifiers::NONE, Key::Num0)),
             )
         });
-        // Ctrl+V: egui turns it into a text Paste event (or nothing for images),
-        // so check both and read the clipboard ourselves.
-        let paste = ctx.input(|i| {
-            i.events.iter().any(|e| {
-                matches!(e, egui::Event::Paste(_))
-                    || matches!(e, egui::Event::Key { key: Key::V, pressed: true, modifiers, .. } if modifiers.command)
-            })
+        // Ctrl+V arrives as a key event (clipboard_shortcuts is off); also accept
+        // Paste / PasteImage in case a platform still emits them.
+        let paste_key = ctx.input_mut(|i| i.consume_shortcut(&sc(Modifiers::COMMAND, Key::V)));
+        let (paste_text, paste_image) = ctx.input(|i| {
+            let text = i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)));
+            let img = i.events.iter().find_map(|e| match e {
+                egui::Event::PasteImage(img) => Some(img.clone()),
+                _ => None,
+            });
+            (text, img)
         });
+        let paste = paste_key || paste_text;
         if ctx.egui_wants_keyboard_input() {
             return;
         }
         if open {
             self.open_dialog(ctx);
         }
-        if paste {
+        if let Some(ci) = paste_image {
+            let bytes: Vec<u8> = ci.pixels.iter().flat_map(|c| c.to_srgba_unmultiplied()).collect();
+            if let Some(rgba) = RgbaImage::from_raw(ci.size[0] as u32, ci.size[1] as u32, bytes) {
+                self.set_doc(ctx, DynamicImage::ImageRgba8(rgba), "pasted image".into(), None);
+            }
+        } else if paste {
             self.paste(ctx);
         }
         if copy {
