@@ -137,7 +137,7 @@ make screenshots      # regenerate docs/screenshots (needs a display and the mod
 
 `.github/workflows/release.yml` builds and publishes a release only when the version changes: bump
 `version` under `[workspace.package]` in `Cargo.toml` and push to `main`. It runs the tests, builds Linux (CPU, CUDA) and
-Windows (DirectML) variants, and creates the `v<version>` tag and release with both tarballs and sha256 files. Pushes that edit
+Windows (DirectML) variants, and creates the `v<version>` tag and release with all three archives and their sha256 files. Pushes that edit
 `Cargo.toml` without changing the version, or whose `v<version>` tag already exists, do nothing. A manual run
 (*Actions → Release → Run workflow*) builds artifacts only, unless *publish* is checked.
 
