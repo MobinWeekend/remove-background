@@ -38,7 +38,7 @@ make bench IMG=x.jpg  # time every installed model
   If a model fails on the GPU at run time (e.g. out of VRAM), it is retried on the GPU after freeing other
   sessions, then on CPU. BiRefNet / BRIA 2.0 at 1024² need roughly 8 GB+ of VRAM.
 
-| model (girl-1.jpg) | Ryzen 24-thread CPU | RTX 5070 Ti |
+| model (girl-1.jpg, 600×399) | 24-thread CPU | RTX 5070 Ti |
 |---|---:|---:|
 | isnet-general-use | 216 ms | 74 ms |
 | birefnet-general-lite | 2920 ms | 139 ms |
@@ -70,7 +70,7 @@ progress / cancel / delete / sha256 verify, default model, device selection.
 rembg remove photo.jpg -o out/            # -> out/photo.png
 rembg remove *.jpg -m birefnet-general --mask
 rembg remove photo.jpg --bg '#ffffff' -o flat.jpg
-rembg remove photo.jpg --copy             # result to clipboard
+rembg remove photo.jpg --copy             # result to clipboard only (no file)
 rembg compare photo.jpg -o grid.png
 rembg models list | pull <id>|--all | rm <id>
 rembg gui [image]

@@ -82,7 +82,7 @@ struct RemoveArgs {
     /// Hard-threshold the mask at this value (0-255)
     #[arg(long)]
     threshold: Option<u8>,
-    /// Copy the (single) result to the clipboard
+    /// Copy the (single) result to the clipboard (no file is written unless -o is given)
     #[arg(long)]
     copy: bool,
 }
@@ -321,27 +321,29 @@ fn remove(store: &ModelStore, dev: DevicePref, a: RemoveArgs) -> Result<()> {
         let out_img = render(&img, &pred.mask, &a, bg);
 
         let stem = input.file_stem().and_then(|s| s.to_str()).unwrap_or("stdin");
-        let dest: Option<PathBuf> = match &a.output {
-            Some(o) if o.as_os_str() == "-" => None,
-            Some(o) if single_file_out => Some(o.clone()),
-            Some(o) => Some(o.join(format!("{stem}.{}", a.format.ext()))),
-            None if input.as_os_str() == "-" => None,
-            None => Some(input.with_file_name(format!("{stem}_nobg.{}", a.format.ext()))),
+        let dest = match &a.output {
+            Some(o) if o.as_os_str() == "-" => Dest::Stdout,
+            Some(o) if single_file_out => Dest::File(o.clone()),
+            Some(o) => Dest::File(o.join(format!("{stem}.{}", a.format.ext()))),
+            // --copy without -o: clipboard only, no file
+            None if a.copy => Dest::Nowhere,
+            None if input.as_os_str() == "-" => Dest::Stdout,
+            None => Dest::File(input.with_file_name(format!("{stem}_nobg.{}", a.format.ext()))),
         };
+        let summary = format!(
+            "[{} on {}, {:.0} ms{}]",
+            spec.id,
+            pred.device,
+            pred.infer_time.as_secs_f64() * 1e3,
+            pred.load_time.map(|l| format!(", load {:.1}s", l.as_secs_f64())).unwrap_or_default()
+        );
         match &dest {
-            Some(d) => {
+            Dest::File(d) => {
                 save(&out_img, d)?;
-                eprintln!(
-                    "{} -> {}  [{} on {}, {:.0} ms{}]",
-                    input.display(),
-                    d.display(),
-                    spec.id,
-                    pred.device,
-                    pred.infer_time.as_secs_f64() * 1e3,
-                    pred.load_time.map(|l| format!(", load {:.1}s", l.as_secs_f64())).unwrap_or_default()
-                );
+                eprintln!("{} -> {}  {summary}", input.display(), d.display());
             }
-            None => {
+            Dest::Nowhere => eprintln!("{}  {summary}", input.display()),
+            Dest::Stdout => {
                 let fmt = ImageFormat::from_extension(a.format.ext()).unwrap();
                 let mut buf = std::io::Cursor::new(Vec::new());
                 out_img.write_to(&mut buf, fmt)?;
@@ -353,6 +355,12 @@ fn remove(store: &ModelStore, dev: DevicePref, a: RemoveArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+enum Dest {
+    File(PathBuf),
+    Stdout,
+    Nowhere,
 }
 
 fn save(img: &DynamicImage, path: &Path) -> Result<()> {
