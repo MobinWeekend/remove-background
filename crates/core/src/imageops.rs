@@ -4,8 +4,8 @@ use std::path::Path;
 
 use fast_image_resize::{FilterType, ResizeAlg, ResizeOptions, Resizer};
 use image::{
-    DynamicImage, GrayImage, ImageBuffer, ImageDecoder, ImageReader, Luma, Pixel, Rgb, RgbImage,
-    Rgba, RgbaImage,
+    DynamicImage, GrayImage, ImageBuffer, ImageDecoder, ImageReader, Luma, Pixel, Rgb, RgbImage, Rgba,
+    RgbaImage,
 };
 
 use crate::{Error, Result};
@@ -21,8 +21,7 @@ pub fn load(path: impl AsRef<Path>) -> Result<DynamicImage> {
 
 /// Decode an image from memory, honouring EXIF orientation.
 pub fn load_from_memory(bytes: &[u8]) -> Result<DynamicImage> {
-    let mut dec =
-        ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?.into_decoder()?;
+    let mut dec = ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format()?.into_decoder()?;
     let orientation = dec.orientation()?;
     let mut img = DynamicImage::from_decoder(dec)?;
     img.apply_orientation(orientation);
@@ -100,7 +99,7 @@ pub fn over_checker(fg: &RgbaImage, cell: u32) -> RgbaImage {
 pub fn checkerboard(w: u32, h: u32, cell: u32) -> RgbaImage {
     let cell = cell.max(1);
     ImageBuffer::from_fn(w, h, |x, y| {
-        if ((x / cell) + (y / cell)) % 2 == 0 {
+        if ((x / cell) + (y / cell)).is_multiple_of(2) {
             Rgba([204, 204, 204, 255])
         } else {
             Rgba([255, 255, 255, 255])

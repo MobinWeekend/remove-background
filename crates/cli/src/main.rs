@@ -188,11 +188,9 @@ fn ensure_installed(store: &ModelStore, spec: &'static ModelSpec) -> Result<Path
     }
     let pb = ProgressBar::new(spec.size);
     pb.set_style(
-        ProgressStyle::with_template(
-            "{msg:24} [{bar:30}] {bytes}/{total_bytes} {bytes_per_sec} eta {eta}",
-        )
-        .unwrap()
-        .progress_chars("=> "),
+        ProgressStyle::with_template("{msg:24} [{bar:30}] {bytes}/{total_bytes} {bytes_per_sec} eta {eta}")
+            .unwrap()
+            .progress_chars("=> "),
     );
     pb.set_message(format!("downloading {}", spec.id));
     let path = store.download(spec, &AtomicBool::new(false), |done, total| {
@@ -245,7 +243,10 @@ fn remove(store: &ModelStore, dev: DevicePref, a: RemoveArgs) -> Result<()> {
         Some(id) => spec(id)?,
         None => store.default_model(),
     };
-    let bg = a.bg.as_deref().map(|s| imageops::parse_color(s).with_context(|| format!("bad colour '{s}'"))).transpose()?;
+    let bg =
+        a.bg.as_deref()
+            .map(|s| imageops::parse_color(s).with_context(|| format!("bad colour '{s}'")))
+            .transpose()?;
     let inputs = collect_inputs(&a.inputs)?;
     if inputs.is_empty() {
         bail!("no input images");
@@ -255,8 +256,8 @@ fn remove(store: &ModelStore, dev: DevicePref, a: RemoveArgs) -> Result<()> {
     }
     let model_path = ensure_installed(store, spec)?;
     let mut engine = Engine::new(dev)?;
-    let single_file_out = inputs.len() == 1
-        && a.output.as_ref().is_some_and(|o| o.extension().is_some() && !o.is_dir());
+    let single_file_out =
+        inputs.len() == 1 && a.output.as_ref().is_some_and(|o| o.extension().is_some() && !o.is_dir());
     if let Some(o) = &a.output
         && !single_file_out
         && o.as_os_str() != "-"
@@ -477,7 +478,9 @@ fn info(store: &ModelStore, dev: DevicePref) -> Result<()> {
     println!("cache: {}", store.root().display());
     println!("default model: {}", store.default_model().id);
     let def = store.default_model();
-    if let Some(s) = store.installed().into_iter().find(|m| m.id == def.id).or_else(|| store.installed().first().copied()) {
+    if let Some(s) =
+        store.installed().into_iter().find(|m| m.id == def.id).or_else(|| store.installed().first().copied())
+    {
         let mut e = Engine::new(dev)?;
         let img = DynamicImage::new_rgb8(64, 64);
         let p = e.predict(s, &store.path(s), &img)?;

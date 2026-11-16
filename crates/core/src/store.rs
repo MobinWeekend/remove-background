@@ -141,10 +141,7 @@ impl ModelStore {
     }
 
     pub fn config(&self) -> Config {
-        fs::read(self.config_path())
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
+        fs::read(self.config_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
     }
 
     pub fn save_config(&self, cfg: &Config) -> Result<()> {

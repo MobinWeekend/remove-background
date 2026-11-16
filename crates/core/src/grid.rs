@@ -42,8 +42,7 @@ pub fn compose(tiles: &[Tile<'_>], tile_side: u32, bg: TileBg) -> Result<RgbaIma
     let rows = n.div_ceil(cols);
     let cell_w = tw + PAD;
     let cell_h = th + LABEL_H + PAD;
-    let mut out =
-        RgbaImage::from_pixel(cols * cell_w + PAD, rows * cell_h + PAD, Rgba([32, 32, 36, 255]));
+    let mut out = RgbaImage::from_pixel(cols * cell_w + PAD, rows * cell_h + PAD, Rgba([32, 32, 36, 255]));
     let font = FontRef::try_from_slice(epaint_default_fonts::UBUNTU_LIGHT).expect("bundled font");
 
     for (i, t) in tiles.iter().enumerate() {
@@ -53,9 +52,7 @@ pub fn compose(tiles: &[Tile<'_>], tile_side: u32, bg: TileBg) -> Result<RgbaIma
         let fitted = imageops::fit_rgba(t.image, tile_side)?;
         let backed = match bg {
             TileBg::Checker => imageops::over_checker(&fitted, 12),
-            TileBg::Solid(c) => {
-                image::DynamicImage::ImageRgb8(imageops::flatten(&fitted, c)).to_rgba8()
-            }
+            TileBg::Solid(c) => image::DynamicImage::ImageRgb8(imageops::flatten(&fitted, c)).to_rgba8(),
         };
         let ox = x0 + tw.saturating_sub(backed.width()) / 2;
         let oy = y0 + LABEL_H + th.saturating_sub(backed.height()) / 2;
@@ -99,8 +96,7 @@ mod tests {
     #[test]
     fn grid_dims() {
         let a = RgbaImage::from_pixel(100, 50, Rgba([255, 0, 0, 255]));
-        let tiles: Vec<_> =
-            (0..5).map(|i| Tile { label: format!("m{i} · 12 ms"), image: &a }).collect();
+        let tiles: Vec<_> = (0..5).map(|i| Tile { label: format!("m{i} · 12 ms"), image: &a }).collect();
         let g = compose(&tiles, 64, TileBg::Checker).unwrap();
         // 2:1 tiles -> 64x32 cells; grid stays roughly square
         let (w, h) = g.dimensions();
