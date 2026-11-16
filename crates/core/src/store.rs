@@ -22,11 +22,16 @@ pub struct Config {
 }
 
 impl ModelStore {
-    /// `$REMBG_HOME` or `~/.cache/rembg`.
+    /// `$REMBG_HOME`, else `~/.cache/rembg` (Linux/macOS) or `%LOCALAPPDATA%\rembg` (Windows).
     pub fn open_default() -> Result<Self> {
+        let default = if cfg!(windows) {
+            dirs::data_local_dir().map(|d| d.join("rembg"))
+        } else {
+            dirs::home_dir().map(|h| h.join(".cache").join("rembg"))
+        };
         let root = std::env::var_os("REMBG_HOME")
             .map(PathBuf::from)
-            .or_else(|| dirs::home_dir().map(|h| h.join(".cache").join("rembg")))
+            .or(default)
             .ok_or_else(|| Error::Other("cannot determine home directory".into()))?;
         Self::open(root)
     }

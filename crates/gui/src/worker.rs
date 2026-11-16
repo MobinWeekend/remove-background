@@ -161,7 +161,7 @@ fn engine_loop(
                     Ok(p) => {
                         send(Event::Device {
                             device: p.device,
-                            fallback: engine.cuda_fallback_reason.clone(),
+                            fallback: engine.gpu_fallback_reason.clone(),
                         });
                         let cutout = imageops::cutout(&image, &p.mask);
                         let out = Output {

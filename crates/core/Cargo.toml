@@ -21,3 +21,7 @@ thiserror.workspace = true
 tracing.workspace = true
 ab_glyph = "0.2"
 epaint_default_fonts = "0.37"
+
+# Every Windows build gets the DirectML GPU backend (any DirectX 12 GPU); falls back to CPU.
+[target.'cfg(windows)'.dependencies]
+ort = { workspace = true, features = ["directml"] }

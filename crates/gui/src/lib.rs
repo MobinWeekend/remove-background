@@ -117,7 +117,7 @@ pub struct App {
     status: Option<Status>,
     device_pref: DevicePref,
     device: Option<ActiveDevice>,
-    cuda_fallback: Option<String>,
+    gpu_fallback: Option<String>,
     downloads: HashMap<&'static str, (u64, Option<u64>)>,
     /// Models to run once their download completes.
     run_after_download: HashSet<&'static str>,
@@ -178,7 +178,7 @@ impl App {
             status: None,
             device_pref: pref,
             device: None,
-            cuda_fallback: None,
+            gpu_fallback: None,
             downloads: HashMap::new(),
             run_after_download: HashSet::new(),
             compare_models,
@@ -374,7 +374,7 @@ impl App {
                 }
                 Event::Device { device, fallback } => {
                     self.device = Some(device);
-                    self.cuda_fallback = fallback;
+                    self.gpu_fallback = fallback;
                 }
                 Event::Download { model, state } => match state {
                     DlState::Progress(done, total) => {
@@ -776,13 +776,15 @@ impl App {
                     Some(d) => d.to_string(),
                     None => match self.device_pref {
                         DevicePref::Cpu => "CPU".into(),
-                        _ if Engine::cuda_compiled() => "auto (CUDA)".into(),
+                        _ if Engine::auto_gpu().is_some() => {
+                            format!("auto ({})", Engine::auto_gpu().expect("checked"))
+                        }
                         _ => "CPU".into(),
                     },
                 };
                 let r = ui.label(RichText::new(format!("⚙ {dev}")).monospace());
-                if let Some(f) = &self.cuda_fallback {
-                    r.on_hover_text(format!("CUDA fallback: {f}"));
+                if let Some(f) = &self.gpu_fallback {
+                    r.on_hover_text(format!("GPU fallback: {f}"));
                 }
                 if let Some(d) = &self.doc {
                     ui.separator();

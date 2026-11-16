@@ -10,11 +10,23 @@ fn human(bytes: u64) -> String {
     if b >= 1e9 { format!("{:.2} GB", b / 1e9) } else { format!("{:.0} MB", b / 1e6) }
 }
 
+fn open_folder(dir: &std::path::Path) -> std::io::Result<std::process::Child> {
+    let opener = if cfg!(windows) {
+        "explorer"
+    } else if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    std::process::Command::new(opener).arg(dir).spawn()
+}
+
 /// Display a path with the home directory abbreviated to `~`.
 fn tilde(p: &std::path::Path) -> String {
-    match std::env::var_os("HOME").map(std::path::PathBuf::from) {
+    let home = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    match std::env::var_os(home).map(std::path::PathBuf::from) {
         Some(home) if p.starts_with(&home) => {
-            format!("~/{}", p.strip_prefix(&home).unwrap_or(p).display())
+            format!("~{}{}", std::path::MAIN_SEPARATOR, p.strip_prefix(&home).unwrap_or(p).display())
         }
         _ => p.display().to_string(),
     }
@@ -41,9 +53,9 @@ pub fn show(app: &mut App, ui: &mut Ui) {
     ui.horizontal(|ui| {
         ui.label(RichText::new(tilde(&app.store.models_dir())).monospace().small());
         if ui.small_button("Open folder").clicked()
-            && let Err(e) = std::process::Command::new("xdg-open").arg(app.store.models_dir()).spawn()
+            && let Err(e) = open_folder(&app.store.models_dir())
         {
-            app.set_status(format!("xdg-open failed: {e}"), true);
+            app.set_status(format!("Could not open folder: {e}"), true);
         }
     });
     ui.add_space(6.0);
@@ -54,6 +66,10 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         let before = app.device_pref;
         ui.selectable_value(&mut app.device_pref, DevicePref::Auto, "Auto");
         ui.selectable_value(&mut app.device_pref, DevicePref::Cpu, "CPU");
+        if Engine::directml_compiled() {
+            ui.selectable_value(&mut app.device_pref, DevicePref::DirectMl, "DirectML")
+                .on_hover_text("DirectX 12 GPU (NVIDIA, AMD, Intel)");
+        }
         ui.add_enabled_ui(Engine::cuda_compiled(), |ui| {
             ui.selectable_value(&mut app.device_pref, DevicePref::Cuda, "CUDA")
                 .on_disabled_hover_text("This build has no CUDA support (make cuda)");
@@ -61,13 +77,12 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         if app.device_pref != before {
             app.worker.set_device(app.device_pref);
             app.device = None;
-            app.cuda_fallback = None;
+            app.gpu_fallback = None;
         }
         let active = app.device.map(|d| d.to_string()).unwrap_or_else(|| "– (runs on first use)".into());
         ui.label(RichText::new(format!("active: {active}")).weak());
-        if let Some(f) = &app.cuda_fallback {
-            ui.label(RichText::new("⚠ CUDA fallback").color(Color32::from_rgb(240, 170, 80)))
-                .on_hover_text(f);
+        if let Some(f) = &app.gpu_fallback {
+            ui.label(RichText::new("⚠ GPU fallback").color(Color32::from_rgb(240, 170, 80))).on_hover_text(f);
         }
     });
     ui.separator();

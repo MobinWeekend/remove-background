@@ -3279,6 +3279,7 @@ dependencies = [
  "indicatif",
  "rembg-core",
  "rembg-gui",
+ "rfd",
  "tracing-subscriber",
 ]
 

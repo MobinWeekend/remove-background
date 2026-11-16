@@ -24,6 +24,8 @@ enum Device {
     Auto,
     Cpu,
     Cuda,
+    /// DirectX 12 GPU (Windows builds)
+    Directml,
 }
 
 impl From<Device> for DevicePref {
@@ -32,6 +34,7 @@ impl From<Device> for DevicePref {
             Device::Auto => DevicePref::Auto,
             Device::Cpu => DevicePref::Cpu,
             Device::Cuda => DevicePref::Cuda,
+            Device::Directml => DevicePref::DirectMl,
         }
     }
 }
@@ -422,6 +425,20 @@ fn save(img: &DynamicImage, path: &Path) -> Result<()> {
 
 /// Clipboard contents on X11/Wayland live in the owning process, so hand the
 /// image to a detached child that serves it until something else is copied.
+/// Windows/macOS keep clipboard data after the process exits: set it directly.
+#[cfg(not(target_os = "linux"))]
+fn copy_to_clipboard(img: &RgbaImage) -> Result<()> {
+    let data = arboard::ImageData {
+        width: img.width() as usize,
+        height: img.height() as usize,
+        bytes: img.as_raw().as_slice().into(),
+    };
+    arboard::Clipboard::new()?.set_image(data)?;
+    eprintln!("copied {}x{} image to clipboard", img.width(), img.height());
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn copy_to_clipboard(img: &RgbaImage) -> Result<()> {
     let tmp = std::env::temp_dir().join(format!("rembg-clip-{}.png", std::process::id()));
     img.save(&tmp)?;
@@ -565,6 +582,7 @@ fn models(store: &ModelStore, cmd: ModelsCmd) -> Result<()> {
 fn info(store: &ModelStore, dev: DevicePref) -> Result<()> {
     println!("rembg {}", env!("CARGO_PKG_VERSION"));
     println!("cuda compiled: {}", Engine::cuda_compiled());
+    println!("directml compiled: {}", Engine::directml_compiled());
     println!("cache: {}", store.root().display());
     println!("default model: {}", store.default_model().id);
     let def = store.default_model();
@@ -575,8 +593,8 @@ fn info(store: &ModelStore, dev: DevicePref) -> Result<()> {
         let img = DynamicImage::new_rgb8(64, 64);
         let p = e.predict(s, &store.path(s), &img)?;
         println!("probe with {}: running on {}", s.id, p.device);
-        if let Some(r) = &e.cuda_fallback_reason {
-            println!("cuda fallback reason: {r}");
+        if let Some(r) = &e.gpu_fallback_reason {
+            println!("gpu fallback reason: {r}");
         }
     }
     Ok(())

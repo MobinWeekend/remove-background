@@ -18,11 +18,13 @@ use crate::{Error, Result};
 /// Requested execution device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DevicePref {
-    /// CUDA if compiled in and available, else CPU.
+    /// The build's GPU backend (CUDA, or DirectML on Windows) if available, else CPU.
     #[default]
     Auto,
     Cpu,
     Cuda,
+    /// DirectX 12 GPUs on Windows (NVIDIA, AMD, Intel).
+    DirectMl,
 }
 
 /// Device a session actually runs on.
@@ -30,6 +32,7 @@ pub enum DevicePref {
 pub enum ActiveDevice {
     Cpu,
     Cuda,
+    DirectMl,
 }
 
 impl fmt::Display for ActiveDevice {
@@ -37,6 +40,7 @@ impl fmt::Display for ActiveDevice {
         f.write_str(match self {
             ActiveDevice::Cpu => "CPU",
             ActiveDevice::Cuda => "CUDA",
+            ActiveDevice::DirectMl => "DirectML",
         })
     }
 }
@@ -65,9 +69,9 @@ pub struct Engine {
     /// LRU: most recently used at the end.
     loaded: Vec<Loaded>,
     max_loaded: usize,
-    /// Why CUDA was not used (if it was requested/auto and failed).
-    pub cuda_fallback_reason: Option<String>,
-    /// Models that failed at run time on CUDA (e.g. out of VRAM) and now run on CPU.
+    /// Why the GPU backend was not used (if it was requested/auto and failed).
+    pub gpu_fallback_reason: Option<String>,
+    /// Models that failed at run time on the GPU (e.g. out of VRAM) and now run on CPU.
     cpu_only: HashSet<&'static str>,
 }
 
@@ -83,7 +87,7 @@ impl Engine {
             pref,
             loaded: Vec::new(),
             max_loaded: 2,
-            cuda_fallback_reason: None,
+            gpu_fallback_reason: None,
             cpu_only: HashSet::new(),
         })
     }
@@ -91,6 +95,22 @@ impl Engine {
     /// Whether this binary was built with the CUDA execution provider.
     pub const fn cuda_compiled() -> bool {
         cfg!(feature = "cuda")
+    }
+
+    /// Whether this binary has the DirectML execution provider (all Windows builds).
+    pub const fn directml_compiled() -> bool {
+        cfg!(windows)
+    }
+
+    /// GPU backend tried by [`DevicePref::Auto`]: CUDA if compiled in, else DirectML.
+    pub const fn auto_gpu() -> Option<ActiveDevice> {
+        if Self::cuda_compiled() {
+            Some(ActiveDevice::Cuda)
+        } else if Self::directml_compiled() {
+            Some(ActiveDevice::DirectMl)
+        } else {
+            None
+        }
     }
 
     pub fn device_pref(&self) -> DevicePref {
@@ -102,7 +122,7 @@ impl Engine {
         if pref != self.pref {
             self.pref = pref;
             self.unload_all();
-            self.cuda_fallback_reason = None;
+            self.gpu_fallback_reason = None;
             self.cpu_only.clear();
         }
     }
@@ -127,13 +147,28 @@ impl Engine {
         }
     }
 
-    fn build_session(&self, path: &Path, cuda: bool) -> Result<Session> {
+    fn build_session(&self, path: &Path, device: ActiveDevice) -> Result<Session> {
         #[allow(unused_mut)]
         let mut b = Session::builder(&self.env)
             .map_err(ort_err)?
             .with_optimization_level(GraphOptimizationLevel::All)
             .unwrap_or_else(|e| e.recover());
-        if cuda {
+        if device == ActiveDevice::DirectMl {
+            #[cfg(windows)]
+            {
+                // DirectML requires sequential execution and no memory-pattern optimization.
+                b = b
+                    .with_parallel_execution(false)
+                    .unwrap_or_else(|e| e.recover())
+                    .with_memory_pattern(false)
+                    .unwrap_or_else(|e| e.recover())
+                    .with_execution_providers([ort::ep::DirectML::default().build().error_on_failure()])
+                    .map_err(ort_err)?;
+            }
+            #[cfg(not(windows))]
+            return Err(Error::Other("DirectML is only available on Windows".into()));
+        }
+        if device == ActiveDevice::Cuda {
             #[cfg(feature = "cuda")]
             {
                 use ort::ep::{ArenaExtendStrategy, CUDA, cuda::ConvAlgorithmSearch};
@@ -168,23 +203,24 @@ impl Engine {
             self.loaded.remove(0);
         }
         let t = Instant::now();
-        let want_cuda = match self.pref {
-            DevicePref::Cpu => false,
-            DevicePref::Cuda => true,
-            DevicePref::Auto => Self::cuda_compiled() && self.cuda_fallback_reason.is_none(),
-        } && !self.cpu_only.contains(spec.id);
-        let (session, device) = if want_cuda {
-            match self.build_session(path, true) {
-                Ok(s) => (s, ActiveDevice::Cuda),
+        let gpu = match self.pref {
+            DevicePref::Cpu => None,
+            DevicePref::Cuda => Some(ActiveDevice::Cuda),
+            DevicePref::DirectMl => Some(ActiveDevice::DirectMl),
+            DevicePref::Auto => Self::auto_gpu().filter(|_| self.gpu_fallback_reason.is_none()),
+        }
+        .filter(|_| !self.cpu_only.contains(spec.id));
+        let (session, device) = match gpu {
+            Some(dev) => match self.build_session(path, dev) {
+                Ok(s) => (s, dev),
                 Err(e) if self.pref == DevicePref::Auto => {
-                    tracing::warn!("CUDA unavailable, falling back to CPU: {e}");
-                    self.cuda_fallback_reason = Some(e.to_string());
-                    (self.build_session(path, false)?, ActiveDevice::Cpu)
+                    tracing::warn!("{dev} unavailable, falling back to CPU: {e}");
+                    self.gpu_fallback_reason = Some(format!("{dev}: {e}"));
+                    (self.build_session(path, ActiveDevice::Cpu)?, ActiveDevice::Cpu)
                 }
                 Err(e) => return Err(e),
-            }
-        } else {
-            (self.build_session(path, false)?, ActiveDevice::Cpu)
+            },
+            None => (self.build_session(path, ActiveDevice::Cpu)?, ActiveDevice::Cpu),
         };
         self.loaded.push(Loaded { id: spec.id, session, device });
         Ok(Some(t.elapsed()))
@@ -203,13 +239,13 @@ impl Engine {
         let mut device = self.loaded.last().expect("just loaded").device;
         let mut result = self.infer(spec, input.clone());
 
-        // CUDA run-time failure (typically out of VRAM): free other sessions and
+        // GPU run-time failure (typically out of VRAM): free other sessions and
         // retry on the GPU, then fall back to CPU for this model.
         if let Err(e) = &result
-            && device == ActiveDevice::Cuda
+            && device != ActiveDevice::Cpu
             && self.pref == DevicePref::Auto
         {
-            tracing::warn!("{} failed on CUDA: {e}", spec.id);
+            tracing::warn!("{} failed on {device}: {e}", spec.id);
             if self.loaded.len() > 1 {
                 let cur = self.loaded.pop().expect("loaded");
                 self.loaded.clear();

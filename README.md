@@ -1,8 +1,8 @@
 # rembg (native)
 
-Local background removal in Rust: a headless engine, a CLI and a native GUI.
-Drop an image, get a cut-out, and compare 14 models side by side. Runs on CPU or NVIDIA GPU (CUDA), fully offline
-once models are downloaded.
+Local background removal in Rust: a headless engine, a CLI and a native GUI, for Linux and Windows.
+Drop an image, get a cut-out, and compare 14 models side by side. Runs on CPU or GPU (CUDA on Linux, DirectML on
+Windows), fully offline once models are downloaded.
 
 ![Remove tab: BiRefNet cut-out on a checkerboard](docs/screenshots/remove.png)
 
@@ -15,7 +15,8 @@ once models are downloaded.
 - **Compare**: run one image through many models: a grid with per-model inference time and device, synced zoom/pan,
   a mask toggle, an A/B slider for any two models, "use"/"set default" per tile, and export of the whole grid.
 - **Model manager**: 14 models with size, input resolution, licence, download progress, delete, sha256 verify, default.
-- **GPU**: CUDA 13 build with automatic CPU fallback (also per model, e.g. when a model doesn't fit in VRAM).
+- **GPU**: CUDA 13 on Linux, DirectML on Windows (any DirectX 12 GPU), with automatic CPU fallback, also per model,
+  e.g. when a model doesn't fit in VRAM.
 
 ## Screenshots
 
@@ -47,14 +48,22 @@ of the flag behind, while BiRefNet on the right removes it cleanly.
 
 ## Install
 
-Download a release from [Releases](https://github.com/gohorsebr/rembg/releases) (Linux x86_64, glibc ≥ 2.39, e.g. Ubuntu 24.04+):
+Download a release from [Releases](https://github.com/gohorsebr/rembg/releases). Each archive contains `rembg`
+(CLI, and `rembg gui`) and `rembg-gui` (opens the GUI directly).
 
-- `rembg-<ver>-x86_64-linux.tar.gz`: CPU build, a single binary.
-- `rembg-<ver>-x86_64-linux-cuda.tar.gz`: CUDA build. After extracting, run `./fetch-cuda-libs.sh ./lib` once to
-  download the CUDA 13 runtime (~2 GB) next to the binary; see `CUDA.txt`.
+| file | platform | GPU |
+|---|---|---|
+| `rembg-<ver>-x86_64-windows.zip` | Windows 10/11 x64 | DirectML (NVIDIA, AMD, Intel), else CPU |
+| `rembg-<ver>-x86_64-linux.tar.gz` | Linux x86_64, glibc ≥ 2.39 (Ubuntu 24.04+) | CPU |
+| `rembg-<ver>-x86_64-linux-cuda.tar.gz` | same | CUDA 13: run `./fetch-cuda-libs.sh ./lib` once (~2 GB), see `CUDA.txt` |
+
+**Windows**: unzip anywhere and double-click `rembg-gui.exe` (no console window), or run `rembg.exe` from a terminal.
+Models are stored in `%LOCALAPPDATA%\rembg\models`.
+
+**Linux**:
 
 ```sh
-tar xzf rembg-*-x86_64-linux.tar.gz && cd rembg-*/ && ./rembg gui
+tar xzf rembg-*-x86_64-linux.tar.gz && cd rembg-*/ && ./rembg-gui
 ```
 
 ## Models
@@ -73,7 +82,7 @@ tar xzf rembg-*-x86_64-linux.tar.gz && cd rembg-*/ && ./rembg gui
 | `bria-rmbg-1.4` | BRIA | 1024 | 176 MB | non-commercial |
 | `bria-rmbg-2.0` | BRIA | 1024 | 1.02 GB | CC BY-NC 4.0 (non-commercial) |
 
-Models download on first use into `~/.cache/rembg/models` (override with `REMBG_HOME`) and are verified against
+Models download on first use into `~/.cache/rembg/models` (Windows: `%LOCALAPPDATA%\rembg\models`; override with `REMBG_HOME`) and are verified against
 pinned sha256 hashes. Pre/post-processing matches the reference Python
 [rembg](https://github.com/danielgatis/rembg) sessions.
 
@@ -105,7 +114,7 @@ cat in.jpg | rembg remove - -o - > out.png
 rembg compare photo.jpg -o grid.png [-m u2net,isnet-general-use] [--mask]
 rembg models list | pull <id>… | pull --all | rm <id> | verify | default <id>
 rembg info                                  # build / device probe
-rembg --device cpu|cuda|auto …
+rembg --device auto|cpu|cuda|directml …
 ```
 
 ## Build
@@ -127,8 +136,8 @@ make screenshots      # regenerate docs/screenshots (needs a display and the mod
 ### Releases
 
 `.github/workflows/release.yml` builds and publishes a release only when the version changes: bump
-`version` under `[workspace.package]` in `Cargo.toml` and push to `main`. It runs the tests, builds the CPU and CUDA
-variants, and creates the `v<version>` tag and release with both tarballs and sha256 files. Pushes that edit
+`version` under `[workspace.package]` in `Cargo.toml` and push to `main`. It runs the tests, builds Linux (CPU, CUDA) and
+Windows (DirectML) variants, and creates the `v<version>` tag and release with both tarballs and sha256 files. Pushes that edit
 `Cargo.toml` without changing the version, or whose `v<version>` tag already exists, do nothing. A manual run
 (*Actions → Release → Run workflow*) builds artifacts only, unless *publish* is checked.
 
@@ -137,7 +146,8 @@ variants, and creates the `v<version>` tag and release with both tarballs and sh
 - Built against ONNX Runtime 1.31 / CUDA 13: needs an NVIDIA driver ≥ 580 and an Ampere-or-newer GPU.
 - The binary re-execs itself with `<exe dir>/lib` on `LD_LIBRARY_PATH`, so ship `rembg`,
   `libonnxruntime_providers_{cuda,shared}.so` and `lib/` together.
-- `--device auto` (default) uses CUDA when available, else CPU. If a model fails on the GPU at run time
+- Windows builds use DirectML instead (no extra downloads; DirectX 12 GPU). Linux CUDA builds don't exist for Windows yet.
+- `--device auto` (default) uses the build's GPU backend when available, else CPU. If a model fails on the GPU at run time
   (e.g. out of VRAM) it is retried after freeing other sessions, then on CPU. BiRefNet / BRIA 2.0 at 1024² need
   roughly 8 GB+ of VRAM.
 

@@ -1,5 +1,7 @@
 # Build and publish a GitHub release when the workspace version changes.
 #
+# Artifacts: Linux x86_64 (CPU), Linux x86_64 CUDA, Windows x86_64 (DirectML + CPU).
+#
 # - push to main touching Cargo.toml: releases only if [workspace.package] version
 #   differs from the previous commit AND tag v<version> doesn't exist yet.
 # - manual run (Actions -> Release -> Run workflow): builds the current version;
@@ -72,21 +74,32 @@ jobs:
     name: Build (${{ matrix.variant }})
     needs: version
     if: needs.version.outputs.build == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: true
       matrix:
         include:
-          - variant: cpu
+          - variant: linux
+            os: ubuntu-24.04
             features: ""
-            suffix: ""
-          - variant: cuda
+            asset: x86_64-linux
+          - variant: linux-cuda
+            os: ubuntu-24.04
             features: --features rembg-cli/cuda
-            suffix: -cuda
+            asset: x86_64-linux-cuda
+          # Windows builds always include DirectML (any DirectX 12 GPU) + CPU fallback.
+          - variant: windows
+            os: windows-2025
+            features: ""
+            asset: x86_64-windows
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
 
       - name: System dependencies
+        if: runner.os == 'Linux'
         # libssl/pkg-config: ort's build script downloads ONNX Runtime over TLS.
         # Everything GUI-related (X11, Wayland, fontconfig) is dlopen'ed at runtime.
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
@@ -98,7 +111,7 @@ jobs:
           key: ${{ matrix.variant }}
 
       - name: Test
-        if: matrix.variant == 'cpu'
+        if: matrix.variant != 'linux-cuda'
         run: cargo test --workspace --locked
 
       - name: Build
@@ -108,19 +121,29 @@ jobs:
         env:
           VERSION: ${{ needs.version.outputs.version }}
           VARIANT: ${{ matrix.variant }}
-          SUFFIX: ${{ matrix.suffix }}
+          ASSET: ${{ matrix.asset }}
         run: |
           set -euo pipefail
-          name="rembg-$VERSION-x86_64-linux$SUFFIX"
+          name="rembg-$VERSION-$ASSET"
           dir="dist/$name"
           mkdir -p "$dir"
-          cp target/release/rembg README.md "$dir/"
-          if [[ "$VARIANT" == "cuda" ]]; then
-            # provider libs are symlinks into ort's download cache: copy the targets
-            cp -L target/release/libonnxruntime_providers_cuda.so \
-                  target/release/libonnxruntime_providers_shared.so "$dir/"
-            cp scripts/fetch-cuda-libs.sh "$dir/"
-            cat > "$dir/CUDA.txt" <<'EOF'
+          cp README.md "$dir/"
+          case "$VARIANT" in
+            windows)
+              cp target/release/rembg.exe target/release/rembg-gui.exe "$dir/"
+              # runtime DLLs ort placed next to the exe (e.g. DirectML.dll), if any
+              find target/release -maxdepth 1 -iname '*.dll' -exec cp -L {} "$dir/" \;
+              (cd dist && 7z a -tzip -mx=9 "$name.zip" "$name" >/dev/null)
+              archive="$name.zip"
+              ;;
+            linux|linux-cuda)
+              cp target/release/rembg target/release/rembg-gui "$dir/"
+              if [[ "$VARIANT" == "linux-cuda" ]]; then
+                # provider libs are symlinks into ort's download cache: copy the targets
+                cp -L target/release/libonnxruntime_providers_cuda.so \
+                      target/release/libonnxruntime_providers_shared.so "$dir/"
+                cp scripts/fetch-cuda-libs.sh "$dir/"
+                cat > "$dir/CUDA.txt" <<'EOF'
           rembg CUDA build (ONNX Runtime 1.31 / CUDA 13)
 
           Requires an NVIDIA driver >= 580 and an Ampere-or-newer GPU.
@@ -133,17 +156,28 @@ jobs:
           rembg finds ./lib automatically. Without it, rembg runs on CPU.
           Check with:  ./rembg info
           EOF
-          fi
-          tar -C dist -czf "dist/$name.tar.gz" "$name"
-          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
-          ls -lh dist
-          echo "- \`$name.tar.gz\` ($(du -h "dist/$name.tar.gz" | cut -f1))" >> "$GITHUB_STEP_SUMMARY"
+              fi
+              tar -C dist -czf "dist/$name.tar.gz" "$name"
+              archive="$name.tar.gz"
+              ;;
+          esac
+          (cd dist && sha256sum "$archive" > "$archive.sha256")
+          ls -l "$dir" dist
+          echo "- \`$archive\` ($(du -h "dist/$archive" | cut -f1))" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          bin=target/release/rembg; [[ "$RUNNER_OS" == "Windows" ]] && bin=target/release/rembg.exe
+          "$bin" --version
+          "$bin" models list
 
       - uses: actions/upload-artifact@v4
         with:
           name: rembg-${{ matrix.variant }}
           path: |
             dist/*.tar.gz
+            dist/*.zip
             dist/*.sha256
           if-no-files-found: error
 
