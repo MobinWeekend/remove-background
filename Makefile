@@ -4,7 +4,7 @@ FEATURES ?=
 CARGO_FLAGS := $(if $(FEATURES),--features $(addprefix rembg-cli/,$(FEATURES)),)
 BIN := target/release/rembg
 
-.PHONY: help build release cuda cuda-libs run gui test lint fmt check clean models bench
+.PHONY: help build release cuda cuda-libs run gui test lint fmt check clean models bench screenshots
 
 help: ## Show targets
 	@grep -hE '^[a-z-]+:.*##' Makefile | awk -F':.*## ' '{printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
@@ -46,6 +46,9 @@ models: release ## List models and install state
 
 bench: release ## Time every installed model on a sample image: make bench IMG=photo.jpg
 	$(BIN) compare $(IMG) -o /tmp/rembg-bench.png --tile 256
+
+screenshots: release ## Regenerate docs/screenshots (needs a display + models)
+	scripts/screenshots.sh
 
 clean: ## cargo clean
 	$(CARGO) clean

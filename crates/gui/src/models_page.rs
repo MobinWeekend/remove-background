@@ -10,6 +10,16 @@ fn human(bytes: u64) -> String {
     if b >= 1e9 { format!("{:.2} GB", b / 1e9) } else { format!("{:.0} MB", b / 1e6) }
 }
 
+/// Display a path with the home directory abbreviated to `~`.
+fn tilde(p: &std::path::Path) -> String {
+    match std::env::var_os("HOME").map(std::path::PathBuf::from) {
+        Some(home) if p.starts_with(&home) => {
+            format!("~/{}", p.strip_prefix(&home).unwrap_or(p).display())
+        }
+        _ => p.display().to_string(),
+    }
+}
+
 pub fn show(app: &mut App, ui: &mut Ui) {
     let installed = app.store.installed();
     let used: u64 = installed.iter().filter_map(|m| app.store.disk_size(m)).sum();
@@ -29,7 +39,7 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         );
     });
     ui.horizontal(|ui| {
-        ui.label(RichText::new(app.store.models_dir().display().to_string()).monospace().small());
+        ui.label(RichText::new(tilde(&app.store.models_dir())).monospace().small());
         if ui.small_button("Open folder").clicked()
             && let Err(e) = std::process::Command::new("xdg-open").arg(app.store.models_dir()).spawn()
         {

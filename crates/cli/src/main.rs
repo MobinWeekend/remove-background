@@ -52,6 +52,27 @@ enum Cmd {
         /// Tab to start on
         #[arg(long, value_enum, default_value_t = GuiTab::Remove)]
         tab: GuiTab,
+        /// Model for the Remove tab
+        #[arg(short, long)]
+        model: Option<String>,
+        /// Preview background: checker, dark, light or a colour (#rrggbb)
+        #[arg(long)]
+        bg: Option<String>,
+        /// Start in mask view
+        #[arg(long)]
+        mask: bool,
+        /// Models shown in Compare (comma-separated; default: all installed)
+        #[arg(long, value_delimiter = ',')]
+        models: Vec<String>,
+        /// Open Compare side by side for two models: --split a,b
+        #[arg(long, value_delimiter = ',', num_args = 1)]
+        split: Vec<String>,
+        /// Window size, e.g. 1280x820
+        #[arg(long, hide = true)]
+        size: Option<String>,
+        /// Save a PNG of the window once all results are ready, then exit (for docs)
+        #[arg(long, hide = true)]
+        screenshot: Option<PathBuf>,
     },
     /// Show runtime / device info
     Info,
@@ -190,15 +211,35 @@ fn main() -> Result<()> {
         Cmd::Remove(a) => remove(&store, cli.device.into(), a),
         Cmd::Compare(a) => compare(&store, cli.device.into(), a),
         Cmd::Models(m) => models(&store, m),
-        Cmd::Gui { image, tab } => rembg_gui::run(
-            image,
-            cli.device.into(),
-            match tab {
-                GuiTab::Remove => rembg_gui::StartTab::Remove,
-                GuiTab::Compare => rembg_gui::StartTab::Compare,
-                GuiTab::Models => rembg_gui::StartTab::Models,
-            },
-        ),
+        Cmd::Gui { image, tab, model, bg, mask, models, split, size, screenshot } => {
+            let split = match split.as_slice() {
+                [] => None,
+                [a, b] => Some((a.clone(), b.clone())),
+                _ => bail!("--split takes exactly two model ids: --split a,b"),
+            };
+            let size = size
+                .map(|s| {
+                    let (w, h) = s.split_once('x').context("--size WxH")?;
+                    anyhow::Ok([w.parse::<f32>()?, h.parse::<f32>()?])
+                })
+                .transpose()?;
+            rembg_gui::run(rembg_gui::Launch {
+                image,
+                device: cli.device.into(),
+                tab: match tab {
+                    GuiTab::Remove => rembg_gui::StartTab::Remove,
+                    GuiTab::Compare => rembg_gui::StartTab::Compare,
+                    GuiTab::Models => rembg_gui::StartTab::Models,
+                },
+                model,
+                bg,
+                mask,
+                compare_models: models,
+                split,
+                size,
+                screenshot,
+            })
+        }
         Cmd::Info => info(&store, cli.device.into()),
         Cmd::ServeClipboard { png } => serve_clipboard(&png),
     }

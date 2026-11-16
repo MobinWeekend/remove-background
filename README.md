@@ -1,55 +1,78 @@
 # rembg (native)
 
-Local, native background removal in Rust: a headless engine, a CLI and a native GUI.
+Local background removal in Rust: a headless engine, a CLI and a native GUI.
+Drop an image, get a cut-out, and compare 14 models side by side. Runs on CPU or NVIDIA GPU (CUDA), fully offline
+once models are downloaded.
 
-## Layout
+![Remove tab: BiRefNet cut-out on a checkerboard](docs/screenshots/remove.png)
 
-| crate | what |
+## Features
+
+- **Remove**: drop a file, paste (Ctrl+V) or open (Ctrl+O). Background removal runs on a worker thread, so the UI never blocks.
+- **Preview backgrounds**: checkerboard, dark, light or any custom colour; zoom about the cursor, pan, hold Space for the original.
+- **Output**: copy the result straight to the clipboard (no file needed), or save it as a transparent PNG/WebP, flattened
+  onto the preview colour, or as the bare mask.
+- **Compare**: run one image through many models: a grid with per-model inference time and device, synced zoom/pan,
+  a mask toggle, an A/B slider for any two models, "use"/"set default" per tile, and export of the whole grid.
+- **Model manager**: 14 models with size, input resolution, licence, download progress, delete, sha256 verify, default.
+- **GPU**: CUDA 13 build with automatic CPU fallback (also per model, e.g. when a model doesn't fit in VRAM).
+
+## Screenshots
+
+| | |
 |---|---|
-| `crates/core` (`rembg-core`) | headless engine: model registry, download/cache (`~/.cache/rembg/models`, sha256-verified), pre/post-processing, ONNX Runtime inference (CPU, optional CUDA), compositing. No UI deps. |
-| `crates/gui` (`rembg-gui`) | egui/eframe app: drop/paste → cut-out, preview backgrounds, clipboard, compare mode, model manager. |
-| `crates/cli` (`rembg` binary) | `remove`, `compare`, `models`, `gui`. |
+| ![Dark preview background](docs/screenshots/remove-dark.png) | ![Mask view](docs/screenshots/mask.png) |
+| **Preview background**: dark (also checker, light, custom colour) | **Mask view** (M): the raw alpha mask |
 
-## Spec
+### Compare models
 
-- **Remove**: drop / open / paste (Ctrl+V) an image → background removed on a worker thread (UI never blocks).
-- **Preview backgrounds**: checkerboard, dark, light, custom colour; zoom & pan.
-- **Output**: copy result to clipboard (Ctrl+C, no file needed), save PNG/WebP, mask-only, or flattened onto a colour.
-- **Compare**: run the image through every installed model → grid with model name + inference time, synced zoom/pan, cut-out ⇄ mask toggle; pick two for a side-by-side slider; pick a winner (copy/save/set default); save the whole grid as one image (`rembg compare` does the same headless).
-- **Model manager**: all registry models with family, input size, download size, licence, installed state; download (with progress) / delete / set default.
-- **Models**: U²-Net (u2net, u2netp, u2net_human_seg, silueta), ISNet (general, anime), BiRefNet (general, lite, portrait, DIS, HRSOD, massive), BRIA RMBG 1.4 / 2.0 (non-commercial licence — only downloaded on explicit request).
-- **GPU**: `--features cuda` enables the CUDA execution provider; falls back to CPU if CUDA libs are missing.
+Every selected model runs on the same image. Zoom and pan are shared by all tiles, so the same detail is visible
+everywhere; each tile shows inference time and device.
 
-## Build
+![Compare grid of six models](docs/screenshots/compare.png)
 
-```sh
-make release          # CPU build -> target/release/rembg (ONNX Runtime linked statically, single file)
-make cuda             # CUDA build + bundles the CUDA 13 runtime (cudart/cuBLAS/cuDNN/cuFFT, ~2 GB) in target/release/lib
-make check            # fmt + clippy + tests
-make bench IMG=x.jpg  # time every installed model
-```
+Click two tiles, then **Side by side**: drag the divider to compare edges. Here U²-Net (small) on the left leaves part
+of the flag behind, while BiRefNet on the right removes it cleanly.
 
-### GPU (CUDA)
+![Side-by-side slider](docs/screenshots/split.png)
 
-- Built against ONNX Runtime 1.31 / CUDA 13 → needs an NVIDIA driver ≥ 580 and an Ampere-or-newer GPU.
-- The binary re-execs itself with `<exe dir>/lib` on `LD_LIBRARY_PATH`, so ship `rembg`,
-  `libonnxruntime_providers_{cuda,shared}.so` and `lib/` together (`make pull` on the client does this).
-- `--device auto` (default) uses CUDA when it can and falls back to CPU if the CUDA libs are missing.
-  If a model fails on the GPU at run time (e.g. out of VRAM), it is retried on the GPU after freeing other
-  sessions, then on CPU. BiRefNet / BRIA 2.0 at 1024² need roughly 8 GB+ of VRAM.
+### Model manager
 
-| model (girl-1.jpg, 600×399) | 24-thread CPU | RTX 5070 Ti |
-|---|---:|---:|
-| isnet-general-use | 216 ms | 74 ms |
-| birefnet-general-lite | 2920 ms | 139 ms |
-| birefnet-general | 4653 ms | 287 ms |
-| bria-rmbg-2.0 | 4536 ms | 267 ms |
+![Model manager](docs/screenshots/models.png)
+
+> Screenshots were taken on a laptop RTX 3060 (6 GB): small models ran on CUDA, BiRefNet didn't fit in VRAM and
+> fell back to CPU automatically. Images are public domain / CC0 test photos from
+> [scikit-image](https://github.com/scikit-image/scikit-image/tree/v0.19.3/skimage/data): astronaut (NASA),
+> Chelsea the cat (Stefan van der Walt), coffee (Rachel Michetti).
+
+## Models
+
+| id | family | input | size | licence |
+|---|---|---:|---:|---|
+| `u2net` | U²-Net | 320 | 176 MB | Apache-2.0 |
+| `u2netp` | U²-Net (small) | 320 | 5 MB | Apache-2.0 |
+| `u2net_human_seg` | U²-Net (humans) | 320 | 176 MB | Apache-2.0 |
+| `silueta` | U²-Net (pruned) | 320 | 44 MB | Apache-2.0 |
+| `isnet-general-use` *(default)* | ISNet | 1024 | 179 MB | Apache-2.0 |
+| `isnet-anime` | ISNet | 1024 | 176 MB | Apache-2.0 |
+| `birefnet-general` | BiRefNet | 1024 | 973 MB | MIT |
+| `birefnet-general-lite` | BiRefNet | 1024 | 224 MB | MIT |
+| `birefnet-portrait` / `-dis` / `-hrsod` / `-massive` | BiRefNet | 1024 | 973 MB each | MIT |
+| `bria-rmbg-1.4` | BRIA | 1024 | 176 MB | non-commercial |
+| `bria-rmbg-2.0` | BRIA | 1024 | 1.02 GB | CC BY-NC 4.0 (non-commercial) |
+
+Models download on first use into `~/.cache/rembg/models` (override with `REMBG_HOME`) and are verified against
+pinned sha256 hashes. Pre/post-processing matches the reference Python
+[rembg](https://github.com/danielgatis/rembg) sessions.
 
 ## GUI
 
-`rembg gui [image] [--tab remove|compare|models]`
+```sh
+rembg gui [image] [--tab remove|compare|models] [-m MODEL] [--bg dark|light|checker|#rrggbb] [--mask]
+          [--models a,b,c] [--split a,b]
+```
 
-| | |
+| keys | |
 |---|---|
 | drop / Ctrl+V / Ctrl+O | load an image (paste accepts image data or a copied file path) |
 | Ctrl+C / Ctrl+S | copy / save the transparent result |
@@ -58,20 +81,49 @@ make bench IMG=x.jpg  # time every installed model
 | M / B | toggle mask view / cycle background (checker → dark → light → custom) |
 | Ctrl+1/2/3 | Remove / Compare / Models tabs |
 
-**Compare**: tiles share zoom/pan; click two tiles → *Side by side* slider; per tile *Use* (open in Remove),
-📋 copy, ★ set default; *Save grid…* exports the labelled grid with the current background.
-
-**Models**: install state, size, input resolution, licence (non-commercial highlighted), download with
-progress / cancel / delete / sha256 verify, default model, device selection.
-
 ## CLI
 
 ```sh
-rembg remove photo.jpg -o out/            # -> out/photo.png
-rembg remove *.jpg -m birefnet-general --mask
+rembg remove photo.jpg                      # -> photo_nobg.png
+rembg remove photo.jpg --copy               # result to clipboard only (no file)
+rembg remove shots/ -o out/ -m birefnet-general
+rembg remove photo.jpg --mask -o mask.png
 rembg remove photo.jpg --bg '#ffffff' -o flat.jpg
-rembg remove photo.jpg --copy             # result to clipboard only (no file)
-rembg compare photo.jpg -o grid.png
-rembg models list | pull <id>|--all | rm <id>
-rembg gui [image]
+cat in.jpg | rembg remove - -o - > out.png
+rembg compare photo.jpg -o grid.png [-m u2net,isnet-general-use] [--mask]
+rembg models list | pull <id>… | pull --all | rm <id> | verify | default <id>
+rembg info                                  # build / device probe
+rembg --device cpu|cuda|auto …
 ```
+
+## Build
+
+```sh
+make release          # CPU build -> target/release/rembg (ONNX Runtime linked statically, single file)
+make cuda             # CUDA build + bundles the CUDA 13 runtime (cudart/cuBLAS/cuDNN/cuFFT, ~2 GB) in target/release/lib
+make check            # fmt + clippy + tests
+make bench IMG=x.jpg  # time every installed model
+make screenshots      # regenerate docs/screenshots (needs a display and the models used)
+```
+
+| crate | |
+|---|---|
+| `crates/core` (`rembg-core`) | headless engine: model registry, download/cache, pre/post-processing, ONNX Runtime inference, compositing, comparison grid. No UI deps. |
+| `crates/gui` (`rembg-gui`) | egui/eframe app. |
+| `crates/cli` (`rembg` binary) | `remove`, `compare`, `models`, `info`, `gui`. |
+
+### GPU (CUDA)
+
+- Built against ONNX Runtime 1.31 / CUDA 13: needs an NVIDIA driver ≥ 580 and an Ampere-or-newer GPU.
+- The binary re-execs itself with `<exe dir>/lib` on `LD_LIBRARY_PATH`, so ship `rembg`,
+  `libonnxruntime_providers_{cuda,shared}.so` and `lib/` together.
+- `--device auto` (default) uses CUDA when available, else CPU. If a model fails on the GPU at run time
+  (e.g. out of VRAM) it is retried after freeing other sessions, then on CPU. BiRefNet / BRIA 2.0 at 1024² need
+  roughly 8 GB+ of VRAM.
+
+| model (600×399 photo) | 24-thread CPU | RTX 5070 Ti |
+|---|---:|---:|
+| isnet-general-use | 216 ms | 74 ms |
+| birefnet-general-lite | 2920 ms | 139 ms |
+| birefnet-general | 4653 ms | 287 ms |
+| bria-rmbg-2.0 | 4536 ms | 267 ms |

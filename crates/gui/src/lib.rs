@@ -28,13 +28,35 @@ pub enum StartTab {
     Models,
 }
 
-pub fn run(image: Option<PathBuf>, device: DevicePref, start: StartTab) -> anyhow::Result<()> {
+/// How to start the GUI. Everything except `image`/`device` is optional initial state
+/// (also used to produce reproducible screenshots with `screenshot`).
+#[derive(Debug, Clone, Default)]
+pub struct Launch {
+    pub image: Option<PathBuf>,
+    pub device: DevicePref,
+    pub tab: StartTab,
+    /// Model for the Remove tab (default: configured default model).
+    pub model: Option<String>,
+    /// "checker", "dark", "light" or a colour (#rrggbb / name).
+    pub bg: Option<String>,
+    pub mask: bool,
+    /// Models shown in Compare (default: all installed).
+    pub compare_models: Vec<String>,
+    /// Open Compare in side-by-side mode with these two models.
+    pub split: Option<(String, String)>,
+    /// Inner window size in points.
+    pub size: Option<[f32; 2]>,
+    /// Once every result is ready, save a PNG of the window here and exit.
+    pub screenshot: Option<PathBuf>,
+}
+
+pub fn run(launch: Launch) -> anyhow::Result<()> {
     let store = ModelStore::open_default()?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("rembg")
             .with_app_id("rembg")
-            .with_inner_size([1280.0, 820.0])
+            .with_inner_size(launch.size.unwrap_or([1280.0, 820.0]))
             .with_min_inner_size([640.0, 420.0])
             .with_drag_and_drop(true),
         // Deliver Ctrl+C / Ctrl+V as plain key events: we handle image clipboard
@@ -42,12 +64,8 @@ pub fn run(image: Option<PathBuf>, device: DevicePref, start: StartTab) -> anyho
         clipboard_shortcuts: false,
         ..Default::default()
     };
-    eframe::run_native(
-        "rembg",
-        options,
-        Box::new(move |cc| Ok(Box::new(App::new(cc, store, device, image, start)))),
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))
+    eframe::run_native("rembg", options, Box::new(move |cc| Ok(Box::new(App::new(cc, store, launch)))))
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,20 +126,38 @@ pub struct App {
     selected: Vec<&'static str>,
     split_mode: bool,
     split_pos: f32,
+    // --screenshot
+    screenshot: Option<PathBuf>,
+    shot_ready_frames: u32,
+    shot_requested: bool,
+    shot_done: Arc<std::sync::atomic::AtomicBool>,
+    started: Instant,
 }
 
 impl App {
-    fn new(
-        cc: &eframe::CreationContext<'_>,
-        store: ModelStore,
-        pref: DevicePref,
-        image: Option<PathBuf>,
-        start: StartTab,
-    ) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, store: ModelStore, launch: Launch) -> Self {
         let ctx = cc.egui_ctx.clone();
-        let model = store.default_model();
+        let pref = launch.device;
+        let start = launch.tab;
+        let model = launch.model.as_deref().and_then(registry::find).unwrap_or_else(|| store.default_model());
         let worker = Worker::spawn(ctx.clone(), store.clone(), pref);
-        let compare_models = store.installed().iter().map(|m| m.id).collect();
+        let mut compare_models: HashSet<&'static str> =
+            launch.compare_models.iter().filter_map(|id| registry::find(id)).map(|m| m.id).collect();
+        if let Some((a, b)) = &launch.split {
+            compare_models.extend([a, b].into_iter().filter_map(|id| registry::find(id)).map(|m| m.id));
+        }
+        if compare_models.is_empty() {
+            compare_models = store.installed().iter().map(|m| m.id).collect();
+        }
+        let custom_color = Color32::from_rgb(0, 177, 64);
+        let bg = match launch.bg.as_deref() {
+            None | Some("checker") => Bg::Checker,
+            Some("dark") => Bg::Dark,
+            Some("light") => Bg::Light,
+            Some(c) => imageops::parse_color(c)
+                .map(|[r, g, b]| Bg::Custom(Color32::from_rgb(r, g, b)))
+                .unwrap_or(Bg::Checker),
+        };
         let mut app = Self {
             checker: view::checker_texture(&ctx),
             default_model: model.id,
@@ -134,9 +170,9 @@ impl App {
             },
             doc: None,
             model,
-            bg: Bg::Checker,
-            custom_color: Color32::from_rgb(0, 177, 64),
-            show_mask: false,
+            bg,
+            custom_color: if let Bg::Custom(c) = bg { c } else { custom_color },
+            show_mask: launch.mask,
             view: ViewState::default(),
             clipboard: None,
             status: None,
@@ -149,11 +185,59 @@ impl App {
             selected: Vec::new(),
             split_mode: false,
             split_pos: 0.5,
+            screenshot: launch.screenshot,
+            shot_ready_frames: 0,
+            shot_requested: false,
+            shot_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            started: Instant::now(),
         };
-        if let Some(p) = image {
+        if let Some(p) = launch.image {
             app.open_path(&ctx, p);
         }
+        if let Some((a, b)) = &launch.split
+            && let (Some(a), Some(b)) = (registry::find(a), registry::find(b))
+        {
+            app.selected = vec![a.id, b.id];
+            app.split_mode = true;
+        }
         app
+    }
+
+    /// `--screenshot`: once all work is done and a few frames have settled,
+    /// grab the window, save it and quit.
+    fn screenshot_tick(&mut self, ctx: &egui::Context) {
+        use std::sync::atomic::Ordering;
+        let Some(path) = self.screenshot.clone() else { return };
+        if self.shot_done.load(Ordering::Relaxed) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        ctx.request_repaint_after(Duration::from_millis(100));
+        let busy = !self.downloads.is_empty()
+            || self.doc.as_ref().is_some_and(|d| !d.pending.is_empty() || d.running.is_some());
+        let timed_out = self.started.elapsed() > Duration::from_secs(600);
+        if busy && !timed_out {
+            self.shot_ready_frames = 0;
+            return;
+        }
+        self.shot_ready_frames += 1;
+        if self.shot_ready_frames > 10 && !self.shot_requested {
+            self.shot_requested = true;
+            let done = self.shot_done.clone();
+            let ctx2 = ctx.clone();
+            ctx.request_screenshot(move |img| {
+                let bytes: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_srgba_unmultiplied()).collect();
+                match RgbaImage::from_raw(img.size[0] as u32, img.size[1] as u32, bytes) {
+                    Some(rgba) => match rgba.save(&path) {
+                        Ok(()) => eprintln!("screenshot saved to {}", path.display()),
+                        Err(e) => eprintln!("screenshot save failed: {e}"),
+                    },
+                    None => eprintln!("screenshot: bad image data"),
+                }
+                done.store(true, Ordering::Relaxed);
+                ctx2.request_repaint();
+            });
+        }
     }
 
     fn set_status(&mut self, text: impl Into<String>, error: bool) {
@@ -692,7 +776,7 @@ impl App {
                     Some(d) => d.to_string(),
                     None => match self.device_pref {
                         DevicePref::Cpu => "CPU".into(),
-                        _ if Engine::cuda_compiled() => "CUDA?".into(),
+                        _ if Engine::cuda_compiled() => "auto (CUDA)".into(),
                         _ => "CPU".into(),
                     },
                 };
@@ -1018,7 +1102,11 @@ impl App {
             Some(if mask { mask_tex(&ctx, id, r).clone() } else { r.tex.clone() })
         };
         let (Some(ta), Some(tb)) = (tex_of(doc, a, self.show_mask), tex_of(doc, b, self.show_mask)) else {
-            self.split_mode = false;
+            if doc.errors.contains_key(a) || doc.errors.contains_key(b) {
+                self.split_mode = false;
+            } else {
+                ui.centered_and_justified(|ui| ui.spinner());
+            }
             return;
         };
         let name = |id| registry::find(id).map(|m| m.name).unwrap_or(id);
@@ -1093,6 +1181,7 @@ impl eframe::App for App {
         self.handle_events(ctx);
         self.handle_drop(ctx);
         self.shortcuts(ctx);
+        self.screenshot_tick(ctx);
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
