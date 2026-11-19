@@ -50,43 +50,42 @@ jobs:
           PUBLISH_INPUT: ${{ inputs.publish }}
         run: |
           set -euo pipefail
-          ver() { awk '/^\[workspace\.package\]$/{in_section=1; next} /^\[/{in_section=0} in_section && /^version[[:space:]]*=/ {gsub(/[[:space:]]/, "", $0); sub(/^version=\"/, "", $0); sub(/\"$/, "", $0); print; exit}' "$1"; }
-          cur=$(ver Cargo.toml)
-          if ! [[ "$cur" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::could not read a semver [workspace.package] version from Cargo.toml (got '$cur')"; exit 1
-          fi
-          prev=""
-          if [[ -n "${BEFORE:-}" && ! "$BEFORE" =~ ^0+$ ]] && git cat-file -e "$BEFORE:Cargo.toml" 2>/dev/null; then
-            git show "$BEFORE:Cargo.toml" > /tmp/prev.toml && prev=$(ver /tmp/prev.toml)
-          fi
+          # Read only the workspace package version. Avoid escaped quotes in the
+          # awk regular expressions (they are not valid regexp operators).
+          ver() { awk '/^\[workspace\.package\]$/{in_section=1; next} /^\[/{in_section=0} in_section && /^version[[:space:]]*=/ {sub(/^[^=]*=[[:space:]]*"/, ""); sub(/"[[:space:]]*$/, ""); print; exit}' "$1"; }
+          build=false; publish=false; prev=""; tag_exists=false
 
-          tag_exists=false
-          git ls-remote --exit-code --tags origin "refs/tags/v$cur" >/dev/null 2>&1 && tag_exists=true
-
-          build=false; publish=false
           if [[ "$EVENT" == "push" && "$REF_TYPE" == "tag" ]]; then
-            # Explicit tag pushes publish exactly the version encoded in the tag.
+            # The tag is the source of truth. The build job synchronizes Cargo.toml
+            # and Cargo.lock to this version before compiling.
             if [[ ! "$REF_NAME" =~ ^v([0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?)$ ]]; then
               echo "::error::release tag '$REF_NAME' must look like vMAJOR.MINOR.PATCH"; exit 1
             fi
-            tag_version="${BASH_REMATCH[1]}"
-            if [[ "$cur" != "$tag_version" ]]; then
-              echo "::error::tag v$tag_version does not match [workspace.package] version $cur in Cargo.toml"; exit 1
+            cur="${BASH_REMATCH[1]}"
+            build=true; publish=true
+          else
+            cur=$(ver Cargo.toml)
+            if ! [[ "$cur" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+              echo "::error::could not read a semver [workspace.package] version from Cargo.toml (got '$cur')"; exit 1
             fi
-            build=true; publish=true
-          elif [[ "$EVENT" == "workflow_dispatch" ]]; then
-            build=true
-            # Allow a manual publish to refresh assets on an existing release too.
-            [[ "$PUBLISH_INPUT" == "true" ]] && publish=true
-          elif [[ "$cur" != "$prev" && "$tag_exists" == "false" ]]; then
-            # A regular `git push origin` after bumping Cargo.toml on main
-            # builds and publishes the new workspace version automatically.
-            build=true; publish=true
+            if [[ -n "${BEFORE:-}" && ! "$BEFORE" =~ ^0+$ ]] && git cat-file -e "$BEFORE:Cargo.toml" 2>/dev/null; then
+              git show "$BEFORE:Cargo.toml" > /tmp/prev.toml && prev=$(ver /tmp/prev.toml)
+            fi
+            git ls-remote --exit-code --tags origin "refs/tags/v$cur" >/dev/null 2>&1 && tag_exists=true
+
+            if [[ "$EVENT" == "workflow_dispatch" ]]; then
+              build=true
+              # Allow a manual publish to refresh assets on an existing release too.
+              [[ "$PUBLISH_INPUT" == "true" ]] && publish=true
+            elif [[ "$cur" != "$prev" && "$tag_exists" == "false" ]]; then
+              # A regular `git push origin` after bumping Cargo.toml on main
+              # builds and publishes the new workspace version automatically.
+              build=true; publish=true
+            fi
           fi
-          echo "Detected workspace version: $cur"
-          echo "Previous workspace version: ${prev:-<none>}"
+          echo "Selected release version: $cur"
+          [[ -n "$prev" ]] && echo "Previous workspace version: $prev"
           echo "Git ref: $REF_TYPE $REF_NAME"
-          echo "Release tag check: v$cur (exists: $tag_exists)"
           echo "Decision: build=$build publish=$publish" | tee -a "$GITHUB_STEP_SUMMARY"
           { echo "version=$cur"; echo "build=$build"; echo "publish=$publish"; } >> "$GITHUB_OUTPUT"
 
@@ -131,9 +130,51 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.variant }}
+
+      - name: Sync Cargo workspace version from release tag
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        env:
+          RELEASE_VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Rewrite only [workspace.package].version. All member crates inherit it
+          # through version.workspace = true.
+          python - "$RELEASE_VERSION" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          version = sys.argv[1]
+          manifest = Path("Cargo.toml")
+          text = manifest.read_text(encoding="utf-8")
+          section = re.search(r"(?ms)^\[workspace\.package\][ \t]*\n(.*?)(?=^\[|\Z)", text)
+          if section is None:
+              raise SystemExit("[workspace.package] section not found in Cargo.toml")
+          body = section.group(1)
+          updated, count = re.subn(
+              r'(?m)^version[ \t]*=[ \t]*"[^"\n]+"[ \t]*$',
+              f'version = "{version}"',
+              body,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit("version field not found in [workspace.package]")
+          text = text[:section.start(1)] + updated + text[section.end(1):]
+          manifest.write_text(text, encoding="utf-8")
+          print(f"Set [workspace.package].version = {version}")
+          PY
+          # Update the locked versions of rembg-cli/core/gui without refreshing
+          # unrelated dependency versions. Subsequent builds can use --locked.
+          cargo update --workspace
+          grep -A4 '^\[workspace.package\]' Cargo.toml
+          grep -A3 -E '^name = "rembg-(cli|core|gui)"$' Cargo.lock
 
       - name: Test
         if: matrix.variant != 'linux-cuda' && matrix.variant != 'windows-cuda'
