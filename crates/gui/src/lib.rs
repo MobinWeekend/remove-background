@@ -1231,8 +1231,9 @@ impl eframe::App for App {
                 egui::ViewportId::from_hash_of("rembg-batch-window"),
                 egui::ViewportBuilder::default()
                     .with_title("Batch background removal")
-                    .with_inner_size([760.0, 690.0])
-                    .with_min_inner_size([620.0, 560.0]),
+                    .with_inner_size([900.0, 790.0])
+                    .with_min_inner_size([760.0, 680.0])
+                    .with_drag_and_drop(true),
                 move |ui, _class| batch.show(ui, store, worker),
             );
         }

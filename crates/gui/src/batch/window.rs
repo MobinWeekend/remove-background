@@ -3,19 +3,23 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, atomic::Ordering};
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
 
-use egui::{Color32, RichText};
-use rembg_core::{ModelStore, registry};
+use egui::{Color32, RichText, TextureHandle, Vec2, vec2};
+use image::RgbaImage;
+use rembg_core::{ModelStore, imageops, registry};
 
-use crate::worker::Worker;
+use crate::{view, worker::Worker};
 
-use super::{BatchEvent, BatchJob, ItemOutcome};
+use super::{BatchEvent, BatchJob, ItemOutcome, processor};
 
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff", "gif"];
+const PREVIEW_MAX_SIDE: u32 = 768;
 
 struct QueueItem {
     path: PathBuf,
+    output_path: PathBuf,
     state: ItemState,
 }
 
@@ -36,14 +40,42 @@ struct ActiveBatch {
     completed: usize,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct PreviewKey {
+    input: PathBuf,
+    output: PathBuf,
+}
+
+struct PreviewImage {
+    texture: TextureHandle,
+    dimensions: [u32; 2],
+}
+
+struct PreviewLoadResult {
+    before: Result<(RgbaImage, [u32; 2]), String>,
+    after: Result<Option<(RgbaImage, [u32; 2])>, String>,
+}
+
+struct PreviewCache {
+    key: PreviewKey,
+    receiver: Option<mpsc::Receiver<PreviewLoadResult>>,
+    before: Option<PreviewImage>,
+    after: Option<PreviewImage>,
+    before_error: Option<String>,
+    after_error: Option<String>,
+    loading: bool,
+}
+
 pub struct BatchWindow {
     pub open: bool,
     items: Vec<QueueItem>,
+    selected_item: Option<PathBuf>,
+    preview: Option<PreviewCache>,
     output_dir: PathBuf,
     output_dir_set: bool,
     recursive: bool,
     suffix: String,
-    overwrite: bool,
+    skip_existing: bool,
     selected_model: String,
     next_job_id: u64,
     active: Option<ActiveBatch>,
@@ -56,13 +88,15 @@ impl BatchWindow {
         Self {
             open: false,
             items: Vec::new(),
+            selected_item: None,
+            preview: None,
             output_dir: std::env::current_dir()
                 .unwrap_or_default()
                 .join("Background Removed"),
             output_dir_set: false,
             recursive: false,
             suffix: "_nobg".into(),
-            overwrite: false,
+            skip_existing: true,
             selected_model: default_model.into(),
             next_job_id: 1,
             active: None,
@@ -87,20 +121,26 @@ impl BatchWindow {
                 }
             }
             BatchEvent::ItemFinished { id, index, outcome } => {
-                if let Some(active) = self.active.as_mut().filter(|a| a.id == id) {
-                    active.completed += 1;
+                let matching_batch = self.active.as_ref().is_some_and(|a| a.id == id);
+                if matching_batch {
+                    if let Some(active) = self.active.as_mut() {
+                        active.completed += 1;
+                    }
                     if let Some(item) = self.items.get_mut(index) {
                         item.state = match outcome {
                             ItemOutcome::Saved { output } => {
-                                let _ = output;
+                                item.output_path = output;
                                 ItemState::Saved
                             }
                             ItemOutcome::Skipped { output } => {
-                                let _ = output;
+                                item.output_path = output;
                                 ItemState::Skipped
                             }
                             ItemOutcome::Failed { error } => ItemState::Failed(error),
                         };
+                        if self.selected_item.as_ref() == Some(&item.path) {
+                            self.preview = None;
+                        }
                     }
                 }
             }
@@ -111,7 +151,10 @@ impl BatchWindow {
                     let skipped = self.items.iter().filter(|i| matches!(&i.state, ItemState::Skipped)).count();
                     let failed = self.items.iter().filter(|i| matches!(&i.state, ItemState::Failed(_))).count();
                     self.notice = Some(if cancelled {
-                        format!("Cancelled · {}/{} completed · {saved} saved · {skipped} skipped · {failed} failed", active.completed, active.total)
+                        format!(
+                            "Cancelled · {}/{} completed · {saved} saved · {skipped} skipped · {failed} failed",
+                            active.completed, active.total
+                        )
                     } else {
                         format!("Finished · {saved} saved · {skipped} skipped · {failed} failed")
                     });
@@ -140,39 +183,48 @@ impl BatchWindow {
             return;
         }
 
+        let dropped_files = ui.input(|i| i.raw.dropped_files.clone());
+        let busy = self.active.is_some() || self.waiting_for_model.is_some();
+        if !dropped_files.is_empty() {
+            if busy {
+                self.notice = Some("Wait for the current batch to finish before adding more files.".into());
+            } else {
+                let paths = dropped_files.into_iter().map(|file| file.path().to_path_buf()).collect();
+                self.add_sources(paths);
+            }
+        }
+
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.heading("Batch background removal");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .add_enabled(
-                        self.active.is_none() && self.waiting_for_model.is_none(),
-                        egui::Button::new("Clear queue"),
-                    )
+                    .add_enabled(!busy && !self.items.is_empty(), egui::Button::new("Clear queue"))
                     .clicked()
                 {
                     self.items.clear();
+                    self.selected_item = None;
+                    self.preview = None;
                     self.notice = None;
                 }
             });
         });
-        ui.label("Process a list of images in the background. Results are saved as transparent PNGs.");
+        ui.label(RichText::new("Drop images or folders here, or add them below. Results are saved as transparent PNGs.").weak());
         ui.add_space(8.0);
 
-        let busy = self.active.is_some() || self.waiting_for_model.is_some();
         ui.horizontal(|ui| {
             ui.add_enabled_ui(!busy, |ui| {
-                if ui.button("＋ Add files…").clicked() {
+                if ui.button("+ Add files…").clicked() {
                     let files = rfd::FileDialog::new()
                         .add_filter("Images", IMAGE_EXTENSIONS)
                         .pick_files()
                         .unwrap_or_default();
-                    self.add_files(files);
+                    self.add_sources(files);
                 }
-                if ui.button("＋ Add folder…").clicked()
+                if ui.button("+ Add folder…").clicked()
                     && let Some(folder) = rfd::FileDialog::new().pick_folder()
                 {
-                    self.add_folder(folder);
+                    self.add_sources(vec![folder]);
                 }
                 ui.checkbox(&mut self.recursive, "Include subfolders");
             });
@@ -180,54 +232,26 @@ impl BatchWindow {
 
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("{} images queued", self.items.len())).strong());
+            ui.label(RichText::new(format!("Queue · {} image(s)", self.items.len())).strong());
             if let Some(active) = &self.active {
-                ui.label(format!("· {} of {} completed", active.completed, active.total));
+                ui.label(RichText::new(format!("{} of {} completed", active.completed, active.total)).weak());
             }
         });
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            egui::ScrollArea::vertical()
-                .max_height(230.0)
-                .auto_shrink([false; 2])
-                .show(ui, |ui| {
-                    if self.items.is_empty() {
-                        ui.add_space(28.0);
-                        ui.vertical_centered(|ui| {
-                            ui.label(RichText::new("Add images or choose a folder to begin").weak());
-                        });
-                        ui.add_space(28.0);
-                    } else {
-                        let mut remove = None;
-                        for (index, item) in self.items.iter().enumerate() {
-                            ui.horizontal(|ui| {
-                                let (state, color, error) = item_state_label(&item.state);
-                                ui.label(RichText::new(state).color(color).monospace().size(11.0));
-                                let name = item.path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
-                                let label = ui.label(name.to_string());
-                                let tooltip = error.map_or_else(
-                                    || item.path.display().to_string(),
-                                    |message| format!("{}\n{message}", item.path.display()),
-                                );
-                                label.on_hover_text(tooltip);
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.add_enabled(!busy, egui::Button::new("×").frame(false)).clicked() {
-                                        remove = Some(index);
-                                    }
-                                });
-                            });
-                        }
-                        if let Some(index) = remove {
-                            self.items.remove(index);
-                        }
-                    }
-                });
+
+        let ctx = ui.ctx().clone();
+        ui.columns(2, |columns| {
+            self.show_queue(&mut columns[0], busy);
+            self.show_preview(&mut columns[1], &ctx);
         });
 
-        ui.add_space(10.0);
+        ui.add_space(8.0);
+        ui.separator();
         ui.heading("Output");
+        let mut output_settings_changed = false;
         ui.horizontal(|ui| {
             ui.label("Folder");
-            ui.label(RichText::new(self.output_dir.display().to_string()).weak());
+            let folder_text = self.output_dir.display().to_string();
+            ui.label(RichText::new(folder_text.clone()).weak()).on_hover_text(folder_text);
             if ui
                 .add_enabled(!busy, egui::Button::new("Choose…"))
                 .clicked()
@@ -235,52 +259,61 @@ impl BatchWindow {
             {
                 self.output_dir = folder;
                 self.output_dir_set = true;
+                output_settings_changed = true;
             }
         });
         ui.horizontal(|ui| {
             ui.label("Filename suffix");
-            ui.add_enabled(!busy, egui::TextEdit::singleline(&mut self.suffix).desired_width(150.0));
+            output_settings_changed |= ui
+                .add_enabled(!busy, egui::TextEdit::singleline(&mut self.suffix).desired_width(130.0))
+                .changed();
             ui.add_enabled_ui(!busy, |ui| {
-                ui.checkbox(&mut self.overwrite, "Overwrite existing outputs");
+                ui.checkbox(&mut self.skip_existing, "Skip files that already exist");
             });
         });
         ui.label(RichText::new("Example: photo.jpg → photo_nobg.png").small().weak());
+        if output_settings_changed {
+            self.update_output_paths();
+            self.preview = None;
+        }
 
-        ui.add_space(8.0);
-        ui.heading("Model");
-        ui.add_enabled_ui(!busy, |ui| {
-            egui::ComboBox::from_id_salt("batch-model")
-                .selected_text(
-                    registry::find(&self.selected_model)
-                        .map(|m| {
-                            format!(
-                                "{}{}",
-                                m.name,
-                                if store.is_installed(m) { "" } else { " · download required" }
-                            )
-                        })
-                        .unwrap_or_else(|| "Choose model".into()),
-                )
-                .show_ui(ui, |ui| {
-                    for model in registry::MODELS {
-                        let text = if store.is_installed(model) {
-                            model.name.to_string()
-                        } else {
-                            format!("{} · download", model.name)
-                        };
-                        if ui.selectable_label(self.selected_model == model.id, text).clicked() {
-                            self.selected_model = model.id.into();
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label("Model");
+            ui.add_enabled_ui(!busy, |ui| {
+                egui::ComboBox::from_id_salt("batch-model")
+                    .selected_text(
+                        registry::find(&self.selected_model)
+                            .map(|model| {
+                                format!(
+                                    "{}{}",
+                                    model.name,
+                                    if store.is_installed(model) { "" } else { " · download required" }
+                                )
+                            })
+                            .unwrap_or_else(|| "Choose model".into()),
+                    )
+                    .show_ui(ui, |ui| {
+                        for model in registry::MODELS {
+                            let text = if store.is_installed(model) {
+                                model.name.to_string()
+                            } else {
+                                format!("{} · download", model.name)
+                            };
+                            if ui.selectable_label(self.selected_model == model.id, text).clicked() {
+                                self.selected_model = model.id.into();
+                            }
                         }
-                    }
-                });
+                    });
+            });
             if let Some(model) = registry::find(&self.selected_model)
                 && !store.is_installed(model)
             {
-                ui.label(RichText::new("This model will be downloaded before the batch starts.").small().weak());
+                ui.label(RichText::new("Download required before starting").small().weak());
             }
         });
 
-        ui.add_space(10.0);
+        ui.add_space(8.0);
         ui.horizontal(|ui| {
             if self.active.is_none() && self.waiting_for_model.is_none() {
                 let can_start = !self.items.is_empty() && !self.selected_model.is_empty();
@@ -292,7 +325,7 @@ impl BatchWindow {
                 }
             } else if let Some(active) = &self.active {
                 if ui.button("■ Cancel after current image").clicked() {
-                    active.cancel.store(true, Ordering::Relaxed);
+                    active.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                     self.notice = Some("Cancellation requested. The current image will finish first.".into());
                 }
                 let fraction = if active.total == 0 {
@@ -302,7 +335,7 @@ impl BatchWindow {
                 };
                 ui.add(
                     egui::ProgressBar::new(fraction)
-                        .desired_width(190.0)
+                        .desired_width(220.0)
                         .text(format!("{}/{}", active.completed, active.total)),
                 );
             } else {
@@ -316,6 +349,220 @@ impl BatchWindow {
             ui.label(RichText::new(notice).color(ui.visuals().text_color()));
         }
         ui.add_space(6.0);
+
+        if ui.input(|i| !i.raw.hovered_files.is_empty()) {
+            let rect = ui.max_rect();
+            let painter = ui.ctx().layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("batch-drop-overlay"),
+            ));
+            painter.rect_filled(rect, 0.0, Color32::from_black_alpha(150));
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Drop images or folders to add to the batch",
+                egui::FontId::proportional(24.0),
+                Color32::WHITE,
+            );
+        }
+    }
+
+    fn show_queue(&mut self, ui: &mut egui::Ui, busy: bool) {
+        ui.heading("Files");
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .max_height(285.0)
+                .auto_shrink([false; 2])
+                .show(ui, |ui| {
+                    if self.items.is_empty() {
+                        ui.add_space(62.0);
+                        ui.vertical_centered(|ui| {
+                            ui.label(RichText::new("No images added yet").weak());
+                            ui.label(RichText::new("Drop files or folders here").small().weak());
+                        });
+                        ui.add_space(62.0);
+                        return;
+                    }
+
+                    let mut remove_index = None;
+                    let mut selected_path = None;
+                    for (index, item) in self.items.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(!busy, egui::Button::new("×").frame(false).small())
+                                .on_hover_text("Remove from queue")
+                                .clicked()
+                            {
+                                remove_index = Some(index);
+                            }
+
+                            let name = item
+                                .path
+                                .file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| item.path.display().to_string());
+                            let selected = self.selected_item.as_ref() == Some(&item.path);
+                            let (state, color, error) = item_state_label(&item.state);
+                            let response = ui.selectable_label(selected, name).on_hover_text(error.map_or_else(
+                                || format!("{}\n{state}", item.path.display()),
+                                |message| format!("{}\n{state}: {message}", item.path.display()),
+                            ));
+                            if response.clicked() {
+                                selected_path = Some(item.path.clone());
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(RichText::new(state).color(color).monospace().size(10.0));
+                            });
+                        });
+                    }
+
+                    if let Some(path) = selected_path {
+                        if self.selected_item.as_ref() != Some(&path) {
+                            self.selected_item = Some(path);
+                            self.preview = None;
+                        }
+                    }
+                    if let Some(index) = remove_index {
+                        let removed = self.items.remove(index).path;
+                        if self.selected_item.as_ref() == Some(&removed) {
+                            self.selected_item = self
+                                .items
+                                .get(index.min(self.items.len().saturating_sub(1)))
+                                .map(|item| item.path.clone());
+                        }
+                        self.preview = None;
+                        self.update_output_paths();
+                    }
+                });
+        });
+    }
+
+    fn show_preview(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.heading("Preview");
+        let selected = self.selected_item.as_ref().and_then(|path| {
+            self.items
+                .iter()
+                .find(|item| &item.path == path)
+                .map(|item| {
+                    (
+                        PreviewKey { input: item.path.clone(), output: item.output_path.clone() },
+                        matches!(&item.state, ItemState::Queued | ItemState::Processing),
+                    )
+                })
+        });
+        let Some((key, waiting_for_result)) = selected else {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.set_min_height(270.0);
+                ui.vertical_centered(|ui| {
+                    ui.add_space(100.0);
+                    ui.label(RichText::new("Select an image to preview it").weak());
+                });
+            });
+            return;
+        };
+
+        self.ensure_preview(ctx, key);
+
+        let (before, after, before_error, after_error, loading) = self.preview.as_ref().map_or(
+            (None, None, None, None, true),
+            |preview| {
+                (
+                    preview.before.as_ref(),
+                    preview.after.as_ref(),
+                    preview.before_error.as_deref(),
+                    preview.after_error.as_deref(),
+                    preview.loading,
+                )
+            },
+        );
+        let after_hint = if loading {
+            "Loading preview…"
+        } else if waiting_for_result {
+            "Result will appear after processing"
+        } else {
+            "No output available"
+        };
+
+        let before_hint = if loading { "Loading preview…" } else { "Could not load source image" };
+        ui.columns(2, |columns| {
+            show_preview_tile(&mut columns[0], "Before", before, before_error, before_hint);
+            show_preview_tile(
+                &mut columns[1],
+                "After",
+                after,
+                after_error,
+                after_hint,
+            );
+        });
+    }
+
+    fn ensure_preview(&mut self, ctx: &egui::Context, key: PreviewKey) {
+        let needs_load = self.preview.as_ref().is_none_or(|preview| preview.key != key);
+        if needs_load {
+            let (sender, receiver) = mpsc::channel();
+            let input = key.input.clone();
+            let output = key.output.clone();
+            let spawn = std::thread::Builder::new()
+                .name("batch-preview".into())
+                .spawn(move || {
+                    let before = load_preview_pixels(&input);
+                    let after = if output.is_file() {
+                        load_preview_pixels(&output).map(Some)
+                    } else {
+                        Ok(None)
+                    };
+                    let _ = sender.send(PreviewLoadResult { before, after });
+                });
+            self.preview = Some(PreviewCache {
+                key,
+                receiver: Some(receiver),
+                before: None,
+                after: None,
+                before_error: None,
+                after_error: None,
+                loading: spawn.is_ok(),
+            });
+            if let Err(error) = spawn
+                && let Some(preview) = self.preview.as_mut()
+            {
+                preview.receiver = None;
+                preview.before_error = Some(format!("Could not start preview loader: {error}"));
+            }
+        }
+
+        let loaded = self
+            .preview
+            .as_ref()
+            .and_then(|preview| preview.receiver.as_ref())
+            .and_then(|receiver| receiver.try_recv().ok());
+        if let Some(loaded) = loaded
+            && let Some(preview) = self.preview.as_mut()
+        {
+            preview.receiver = None;
+            preview.loading = false;
+            match loaded.before {
+                Ok((pixels, dimensions)) => {
+                    preview.before = Some(PreviewImage {
+                        texture: view::load_texture(ctx, "batch-preview-before", &pixels),
+                        dimensions,
+                    });
+                }
+                Err(error) => preview.before_error = Some(error),
+            }
+            match loaded.after {
+                Ok(Some((pixels, dimensions))) => {
+                    preview.after = Some(PreviewImage {
+                        texture: view::load_texture(ctx, "batch-preview-after", &pixels),
+                        dimensions,
+                    });
+                }
+                Ok(None) => {}
+                Err(error) => preview.after_error = Some(error),
+            }
+        }
+        if self.preview.as_ref().is_some_and(|preview| preview.loading) {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
     }
 
     fn request_start(&mut self, store: &ModelStore, worker: &mut Worker) {
@@ -330,7 +577,7 @@ impl BatchWindow {
 
         if !store.is_installed(spec) {
             self.waiting_for_model = Some(spec.id);
-            self.notice = Some(format!("Downloading {} before starting the batch…", spec.name));
+            self.notice = Some(format!("Downloading {} before the batch starts…", spec.name));
             worker.download(spec);
             // Close a small race where the model finishes downloading between
             // the installed check above and Worker::download's deduplication.
@@ -351,6 +598,7 @@ impl BatchWindow {
             return;
         }
 
+        self.update_output_paths();
         let files: Vec<PathBuf> = self.items.iter().map(|item| item.path.clone()).collect();
         if files.is_empty() {
             self.notice = Some("Add at least one image first.".into());
@@ -370,45 +618,65 @@ impl BatchWindow {
             files,
             output_dir: self.output_dir.clone(),
             suffix: self.suffix.clone(),
-            overwrite: self.overwrite,
+            skip_existing: self.skip_existing,
             spec,
             cancel,
         });
     }
 
-    fn add_files(&mut self, files: Vec<PathBuf>) {
-        self.add_paths(files);
-    }
-
-    fn add_folder(&mut self, folder: PathBuf) {
-        self.set_default_output_for(&folder);
+    /// Accept both files and folders so file-dialog and OS drag/drop share one path.
+    fn add_sources(&mut self, paths: Vec<PathBuf>) {
         let mut files = Vec::new();
         let mut errors = 0usize;
-        collect_images(&folder, self.recursive, &self.output_dir, &mut files, &mut errors);
-        files.sort();
-        self.add_paths(files);
-        if errors > 0 {
-            self.notice = Some(format!("Some folders could not be read ({errors} access error(s))."));
-        }
-    }
-
-    fn add_paths(&mut self, paths: Vec<PathBuf>) {
-        if let Some(first) = paths.first() {
-            self.set_default_output_for(first.parent().unwrap_or_else(|| Path::new(".")));
-        }
-        let mut known: HashSet<PathBuf> = self.items.iter().map(|item| item.path.clone()).collect();
-        let mut added = 0usize;
         for path in paths {
-            if is_supported_image(&path) && path.is_file() && known.insert(path.clone()) {
-                self.items.push(QueueItem { path, state: ItemState::Queued });
-                added += 1;
+            if path.is_dir() {
+                self.set_default_output_for(&path);
+                collect_images(&path, self.recursive, &self.output_dir, &mut files, &mut errors);
+            } else {
+                files.push(path);
             }
         }
-        self.notice = Some(if added == 0 {
+        files.sort();
+        let added = self.insert_paths(files);
+        self.notice = Some(if errors > 0 {
+            format!("Added {added} image(s); {errors} folder access error(s).")
+        } else if added == 0 {
             "No new supported images were added.".into()
         } else {
             format!("Added {added} image(s).")
         });
+    }
+
+    fn insert_paths(&mut self, paths: Vec<PathBuf>) -> usize {
+        if let Some(first) = paths.first() {
+            self.set_default_output_for(first.parent().unwrap_or_else(|| Path::new(".")));
+        }
+        let mut known: HashSet<PathBuf> = self.items.iter().map(|item| item.path.clone()).collect();
+        let mut added_paths = Vec::new();
+        for path in paths {
+            if is_supported_image(&path) && path.is_file() && known.insert(path.clone()) {
+                added_paths.push(path);
+            }
+        }
+        let added = added_paths.len();
+        self.items.extend(added_paths.into_iter().map(|path| QueueItem {
+            path,
+            output_path: PathBuf::new(),
+            state: ItemState::Queued,
+        }));
+        if self.selected_item.is_none() {
+            self.selected_item = self.items.first().map(|item| item.path.clone());
+        }
+        self.update_output_paths();
+        added
+    }
+
+    fn update_output_paths(&mut self) {
+        let files: Vec<PathBuf> = self.items.iter().map(|item| item.path.clone()).collect();
+        let outputs = processor::output_paths(&files, &self.output_dir, &self.suffix);
+        for (item, output) in self.items.iter_mut().zip(outputs) {
+            item.output_path = output;
+        }
     }
 
     fn set_default_output_for(&mut self, source: &Path) {
@@ -417,6 +685,46 @@ impl BatchWindow {
             self.output_dir_set = true;
         }
     }
+}
+
+fn show_preview_tile(
+    ui: &mut egui::Ui,
+    title: &str,
+    image: Option<&PreviewImage>,
+    error: Option<&str>,
+    placeholder: &str,
+) {
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.set_min_height(252.0);
+        ui.vertical_centered(|ui| {
+            ui.label(RichText::new(title).strong());
+            ui.add_space(5.0);
+            if let Some(image) = image {
+                let available = ui.available_size();
+                let source = vec2(image.dimensions[0] as f32, image.dimensions[1] as f32);
+                let scale = (available.x / source.x.max(1.0))
+                    .min((available.y - 30.0).max(1.0) / source.y.max(1.0))
+                    .min(1.0);
+                let size = source * scale;
+                ui.image((image.texture.id(), size));
+            } else {
+                if let Some(error) = error {
+                    ui.label(RichText::new(error).color(Color32::from_rgb(220, 90, 80)).small());
+                } else {
+                    ui.add_space(78.0);
+                    ui.label(RichText::new(placeholder).weak().small());
+                }
+            }
+        });
+    });
+}
+
+fn load_preview_pixels(path: &Path) -> Result<(RgbaImage, [u32; 2]), String> {
+    let image = imageops::load(path).map_err(|error| format!("Could not read {}: {error}", path.display()))?;
+    let dimensions = [image.width(), image.height()];
+    let fitted = imageops::fit_rgba(&image.to_rgba8(), PREVIEW_MAX_SIDE)
+        .map_err(|error| format!("Could not prepare preview: {error}"))?;
+    Ok((imageops::over_checker(&fitted, 12), dimensions))
 }
 
 fn item_state_label(state: &ItemState) -> (&'static str, Color32, Option<&str>) {

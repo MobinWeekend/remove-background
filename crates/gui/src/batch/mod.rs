@@ -16,7 +16,7 @@ pub(crate) struct BatchJob {
     pub files: Vec<PathBuf>,
     pub output_dir: PathBuf,
     pub suffix: String,
-    pub overwrite: bool,
+    pub skip_existing: bool,
     pub spec: &'static ModelSpec,
     pub cancel: Arc<AtomicBool>,
 }

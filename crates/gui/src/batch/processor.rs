@@ -32,7 +32,7 @@ pub(crate) fn process(
         return;
     }
 
-    let mut destinations = HashSet::new();
+    let outputs = output_paths(&job.files, &job.output_dir, &job.suffix);
     let mut completed = 0usize;
     for (index, input) in job.files.iter().enumerate() {
         if job.cancel.load(std::sync::atomic::Ordering::Relaxed) {
@@ -40,7 +40,7 @@ pub(crate) fn process(
         }
 
         emit(BatchEvent::ItemStarted { id: job.id, index });
-        let output = unique_output_path(input, &job.output_dir, &job.suffix, &mut destinations);
+        let output = outputs[index].clone();
         let outcome = process_one(engine, store, &job, input, &output);
         emit(BatchEvent::ItemFinished { id: job.id, index, outcome });
         completed += 1;
@@ -71,7 +71,7 @@ fn process_one(
         };
     }
 
-    if output.exists() && !job.overwrite {
+    if output.exists() && job.skip_existing {
         return ItemOutcome::Skipped { output };
     }
 
@@ -89,6 +89,19 @@ fn process_one(
         Ok(()) => ItemOutcome::Saved { output },
         Err(error) => ItemOutcome::Failed { error },
     }
+}
+
+/// Plan destination paths once using the same collision rules for the queue preview and worker.
+pub(crate) fn output_paths(
+    files: &[std::path::PathBuf],
+    output_dir: &std::path::Path,
+    suffix: &str,
+) -> Vec<std::path::PathBuf> {
+    let mut used = HashSet::new();
+    files
+        .iter()
+        .map(|input| unique_output_path(input, output_dir, suffix, &mut used))
+        .collect()
 }
 
 fn unique_output_path(
