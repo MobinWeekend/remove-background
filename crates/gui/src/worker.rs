@@ -10,6 +10,8 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use image::{DynamicImage, GrayImage, RgbaImage};
 use rembg_core::{ActiveDevice, DevicePref, Engine, ModelSpec, ModelStore, imageops};
 
+use crate::batch::{self, BatchEvent, BatchJob};
+
 /// Result of running one model on one image.
 pub struct Output {
     pub mask: GrayImage,
@@ -21,6 +23,7 @@ pub struct Output {
 
 enum Cmd {
     Run { job: u64, spec: &'static ModelSpec, image: Arc<DynamicImage> },
+    Batch(BatchJob),
     SetDevice(DevicePref),
 }
 
@@ -30,17 +33,18 @@ pub enum DlState {
     Failed(String),
 }
 
-pub enum Event {
+pub(crate) enum Event {
     Started { job: u64, model: &'static str },
     Done { job: u64, model: &'static str, out: Arc<Output> },
     Failed { job: u64, model: &'static str, error: String },
     Device { device: ActiveDevice, fallback: Option<String> },
     Download { model: &'static str, state: DlState },
+    Batch(BatchEvent),
 }
 
 pub struct Worker {
     tx: Sender<Cmd>,
-    pub rx: Receiver<Event>,
+    pub(crate) rx: Receiver<Event>,
     ev_tx: Sender<Event>,
     /// Jobs below this id are stale and skipped.
     min_job: Arc<AtomicU64>,
@@ -75,6 +79,10 @@ impl Worker {
 
     pub fn run(&self, job: u64, spec: &'static ModelSpec, image: Arc<DynamicImage>) {
         let _ = self.tx.send(Cmd::Run { job, spec, image });
+    }
+
+    pub(crate) fn run_batch(&self, job: BatchJob) {
+        let _ = self.tx.send(Cmd::Batch(job));
     }
 
     pub fn set_device(&self, pref: DevicePref) {
@@ -135,9 +143,28 @@ fn engine_loop(
         Err(e) => {
             tracing::error!("engine init failed: {e}");
             for cmd in rx {
-                if let Cmd::Run { job, spec, .. } = cmd {
-                    let _ = tx.send(Event::Failed { job, model: spec.id, error: e.to_string() });
+                match cmd {
+                    Cmd::Run { job, spec, .. } => {
+                        let _ = tx.send(Event::Failed { job, model: spec.id, error: e.to_string() });
+                    }
+                    Cmd::Batch(job) => {
+                        let total = job.files.len();
+                        let _ = tx.send(Event::Batch(BatchEvent::Started { id: job.id, total }));
+                        for index in 0..total {
+                            let _ = tx.send(Event::Batch(BatchEvent::ItemStarted { id: job.id, index }));
+                            let _ = tx.send(Event::Batch(BatchEvent::ItemFinished {
+                                id: job.id,
+                                index,
+                                outcome: crate::batch::ItemOutcome::Failed {
+                                    error: format!("Inference engine failed to initialize: {e}"),
+                                },
+                            }));
+                        }
+                        let _ = tx.send(Event::Batch(BatchEvent::Finished { id: job.id, cancelled: false }));
+                    }
+                    Cmd::SetDevice(_) => {}
                 }
+                ctx.request_repaint();
             }
             return;
         }
@@ -151,6 +178,9 @@ fn engine_loop(
     for cmd in rx {
         match cmd {
             Cmd::SetDevice(p) => engine.set_device_pref(p),
+            Cmd::Batch(job) => {
+                batch::processor::process(&mut engine, &store, job, |event| send(Event::Batch(event)));
+            }
             Cmd::Run { job, spec, image } => {
                 if job < min_job.load(Ordering::Relaxed) {
                     continue;

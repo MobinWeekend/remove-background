@@ -12,6 +12,8 @@ Windows), fully offline once models are downloaded.
 - **Preview backgrounds**: checkerboard, dark, light or any custom colour; zoom about the cursor, pan, hold Space for the original.
 - **Output**: copy the result straight to the clipboard (no file needed), or save it as a transparent PNG/WebP, flattened
   onto the preview colour, or as the bare mask.
+- **Batch**: open a separate batch window to process multiple files or folders in the background, choose a model and
+  output folder, optionally scan subfolders, skip or overwrite existing PNGs, and cancel after the current image.
 - **Compare**: run one image through many models: a grid with per-model inference time and device, synced zoom/pan,
   a mask toggle, an A/B slider for any two models, "use"/"set default" per tile, and export of the whole grid.
 - **Model manager**: 14 models with size, input resolution, licence, download progress, delete, sha256 verify, default.
@@ -88,6 +90,10 @@ pinned sha256 hashes. Pre/post-processing matches the reference Python
 
 ## GUI
 
+Use **▦ Batch…** in the main window to open the batch window. Add individual files or a folder, choose whether to
+include subfolders, set the output directory and filename suffix, then start the queue. Transparent PNGs are written
+to the output folder; existing outputs are skipped by default. Batch inference reuses the GUI's background engine and model cache rather than creating a separate inference engine.
+
 ```sh
 rembg gui [image] [--tab remove|compare|models] [-m MODEL] [--bg dark|light|checker|#rrggbb] [--mask]
           [--models a,b,c] [--split a,b]
@@ -130,7 +136,7 @@ make screenshots      # regenerate docs/screenshots (needs a display and the mod
 | crate | |
 |---|---|
 | `crates/core` (`rembg-core`) | headless engine: model registry, download/cache, pre/post-processing, ONNX Runtime inference, compositing, comparison grid. No UI deps. |
-| `crates/gui` (`rembg-gui`) | egui/eframe app. |
+| `crates/gui` (`rembg-gui`) | egui/eframe app; the batch workflow is isolated under `src/batch/`. |
 | `crates/cli` (`rembg` binary) | `remove`, `compare`, `models`, `info`, `gui`. |
 
 ### Releases

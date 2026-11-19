@@ -1,5 +1,6 @@
 //! Native GUI (egui/eframe).
 
+mod batch;
 mod models_page;
 mod view;
 mod worker;
@@ -16,6 +17,7 @@ use image::{DynamicImage, RgbaImage};
 use rembg_core::grid::{self, Tile, TileBg};
 use rembg_core::{ActiveDevice, DevicePref, Engine, ModelSpec, ModelStore, imageops, registry};
 
+use batch::BatchWindow;
 use view::{Bg, Layer, Split, ViewState};
 use worker::{DlState, Event, Output, Worker};
 
@@ -104,6 +106,7 @@ struct Status {
 pub struct App {
     store: ModelStore,
     worker: Worker,
+    batch: BatchWindow,
     tab: Tab,
     doc: Option<Doc>,
     model: &'static ModelSpec,
@@ -163,6 +166,7 @@ impl App {
             default_model: model.id,
             store,
             worker,
+            batch: BatchWindow::new(model.id),
             tab: match start {
                 StartTab::Remove => Tab::Remove,
                 StartTab::Compare => Tab::Compare,
@@ -376,6 +380,7 @@ impl App {
                     self.device = Some(device);
                     self.gpu_fallback = fallback;
                 }
+                Event::Batch(event) => self.batch.handle_event(event),
                 Event::Download { model, state } => match state {
                     DlState::Progress(done, total) => {
                         self.downloads.insert(model, (done, total));
@@ -384,6 +389,7 @@ impl App {
                         self.downloads.remove(model);
                         self.worker.download_finished(model);
                         self.set_status(format!("Downloaded {model}"), false);
+                        self.batch.model_downloaded(model, &self.store, &self.worker);
                         if self.run_after_download.remove(model)
                             && let Some(spec) = registry::find(model)
                         {
@@ -394,6 +400,7 @@ impl App {
                     DlState::Failed(e) => {
                         self.downloads.remove(model);
                         self.worker.download_finished(model);
+                        self.batch.model_download_failed(model);
                         self.run_after_download.remove(model);
                         self.set_status(format!("Download of {model} failed: {e}"), true);
                     }
@@ -649,6 +656,9 @@ impl App {
             }
             if ui.button("📋 Paste").on_hover_text("Ctrl+V").clicked() {
                 self.paste(&ctx);
+            }
+            if ui.button("▦ Batch…").on_hover_text("Batch background removal in a separate window").clicked() {
+                self.batch.open = true;
             }
             ui.separator();
             for (t, label) in
@@ -1212,6 +1222,18 @@ impl eframe::App for App {
                 "Drop to remove background",
                 egui::FontId::proportional(28.0),
                 Color32::WHITE,
+            );
+        }
+
+        if self.batch.open {
+            let (batch, store, worker) = (&mut self.batch, &self.store, &mut self.worker);
+            ui.ctx().show_viewport_immediate(
+                egui::ViewportId::from_hash_of("rembg-batch-window"),
+                egui::ViewportBuilder::default()
+                    .with_title("Batch background removal")
+                    .with_inner_size([760.0, 690.0])
+                    .with_min_inner_size([620.0, 560.0]),
+                move |ui, _class| batch.show(ui, store, worker),
             );
         }
     }
