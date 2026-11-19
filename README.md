@@ -1,8 +1,7 @@
 # rembg (native)
 
 Local background removal in Rust: a headless engine, a CLI and a native GUI, for Linux and Windows.
-Drop an image, get a cut-out, and compare 14 models side by side. Runs on CPU or GPU (CUDA on Linux, DirectML on
-Windows), fully offline once models are downloaded.
+Drop an image, get a cut-out, and compare 14 models side by side. Runs on CPU or GPU (CUDA on Linux and Windows, DirectML on Windows), fully offline once models are downloaded.
 
 ![Remove tab: BiRefNet cut-out on a checkerboard](docs/screenshots/remove.png)
 
@@ -18,8 +17,8 @@ Windows), fully offline once models are downloaded.
 - **Compare**: run one image through many models: a grid with per-model inference time and device, synced zoom/pan,
   a mask toggle, an A/B slider for any two models, "use"/"set default" per tile, and export of the whole grid.
 - **Model manager**: 14 models with size, input resolution, licence, download progress, delete, sha256 verify, default.
-- **GPU**: CUDA 13 on Linux, DirectML on Windows (any DirectX 12 GPU), with automatic CPU fallback, also per model,
-  e.g. when a model doesn't fit in VRAM.
+- **GPU**: CUDA 13 on Linux and Windows, DirectML on Windows (any DirectX 12 GPU), with automatic CPU fallback,
+  also per model, e.g. when a model doesn't fit in VRAM.
 
 ## Screenshots
 
@@ -57,11 +56,14 @@ Download a release from [Releases](https://github.com/gohorsebr/rembg/releases).
 | file | platform | GPU |
 |---|---|---|
 | `rembg-<ver>-x86_64-windows.zip` | Windows 10/11 x64 | DirectML (NVIDIA, AMD, Intel), else CPU |
+| `rembg-<ver>-x86_64-windows-cuda.zip` | Windows 10/11 x64 | CUDA 13 (NVIDIA), DirectML, or CPU; CUDA/cuDNN runtime required |
 | `rembg-<ver>-x86_64-linux.tar.gz` | Linux x86_64, glibc ≥ 2.39 (Ubuntu 24.04+) | CPU |
 | `rembg-<ver>-x86_64-linux-cuda.tar.gz` | same | CUDA 13: run `./fetch-cuda-libs.sh` once (~2 GB), see `CUDA.txt` |
 
 **Windows**: unzip anywhere and double-click `rembg-gui.exe` (no console window), or run `rembg.exe` from a terminal.
-Models are stored in `%LOCALAPPDATA%\rembg\models`.
+Models are stored in `%LOCALAPPDATA%\rembg\models`. The CUDA archive requires a compatible NVIDIA driver,
+an Ampere-or-newer NVIDIA GPU, driver >= 580, CUDA 13.x and compatible cuDNN 9.x runtime DLLs available on `PATH`; they are not bundled.
+See `WINDOWS-CUDA.txt` in that archive.
 
 **Linux**:
 
@@ -93,8 +95,10 @@ pinned sha256 hashes. Pre/post-processing matches the reference Python
 
 Use **▦ Batch…** in the main window to open the batch window. Add individual files or a folder, or drag images and
 folders directly into the batch window. Choose whether to include subfolders, select a queued image to compare its
-source and result, set the output directory and filename suffix, then start the queue. Transparent PNGs are written
-to the output folder; the checked **Skip files that already exist** option is enabled by default.
+source and result, drag the dividers between List / Before / After to resize each pane, set the output directory and
+filename suffix, then start the queue. Transparent PNGs are written
+to the output folder; the checked **Skip files that already exist** option is enabled by default. Batch inference
+reuses the GUI's background engine and model cache rather than creating a separate inference engine.
 
 ```sh
 rembg gui [image] [--tab remove|compare|models] [-m MODEL] [--bg dark|light|checker|#rrggbb] [--mask]
@@ -143,18 +147,23 @@ make screenshots      # regenerate docs/screenshots (needs a display and the mod
 
 ### Releases
 
-`.github/workflows/release.yml` builds and publishes a release only when the version changes: bump
-`version` under `[workspace.package]` in `Cargo.toml` and push to `main`. It runs the tests, builds Linux (CPU, CUDA) and
-Windows (DirectML) variants, and creates the `v<version>` tag and release with all three archives and their sha256 files. Pushes that edit
-`Cargo.toml` without changing the version, or whose `v<version>` tag already exists, do nothing. A manual run
-(*Actions → Release → Run workflow*) builds artifacts only, unless *publish* is checked.
+`.github/workflows/release.yml` builds and publishes a release when the workspace version changes. Update `version`
+under `[workspace.package]` in `Cargo.toml`, run `cargo check --workspace` to refresh `Cargo.lock`, commit both files,
+and run `git push origin` from `main`. The workflow builds Linux (CPU, CUDA) and Windows (DirectML/CPU and CUDA)
+variants, then creates the `v<version>` tag and GitHub release with all four archives and their sha256 files. You can
+also explicitly push a matching tag with `git push origin v<version>`; the tag must match `[workspace.package]` in
+`Cargo.toml`. Re-publishing an existing GitHub release updates its assets. Pushes that edit `Cargo.toml` without
+changing the version do nothing. A manual run (*Actions → Release → Run workflow*) defaults to publishing; uncheck
+*publish* to build artifacts only.
 
 ### GPU (CUDA)
 
 - Built against ONNX Runtime 1.31 / CUDA 13: needs an NVIDIA driver ≥ 580 and an Ampere-or-newer GPU.
 - The binary re-execs itself with `<exe dir>/lib` on `LD_LIBRARY_PATH`, so ship `rembg`,
   `libonnxruntime_providers_{cuda,shared}.so` and `lib/` together.
-- Windows builds use DirectML instead (no extra downloads; DirectX 12 GPU). Linux CUDA builds don't exist for Windows yet.
+- Standard Windows builds use DirectML (any compatible DirectX 12 GPU) without extra GPU runtime downloads. The
+  Windows CUDA archive includes the CUDA execution provider but not the NVIDIA CUDA/cuDNN runtime; install compatible
+  CUDA 13.x and cuDNN 9.x DLLs and make sure their directories are on `PATH`. DirectML and CPU remain available.
 - `--device auto` (default) uses the build's GPU backend when available, else CPU. If a model fails on the GPU at run time
   (e.g. out of VRAM) it is retried after freeing other sessions, then on CPU. BiRefNet / BRIA 2.0 at 1024² need
   roughly 8 GB+ of VRAM.

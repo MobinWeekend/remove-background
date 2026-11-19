@@ -1,17 +1,17 @@
 # Build and publish a GitHub release when the workspace version changes.
 #
-# Artifacts: Linux x86_64 (CPU), Linux x86_64 CUDA, Windows x86_64 (DirectML + CPU).
+# Artifacts: Linux x86_64 (CPU/CUDA), Windows x86_64 (DirectML/CPU and CUDA).
 #
-# - push to main touching Cargo.toml: releases only if [workspace.package] version
-#   differs from the previous commit AND tag v<version> doesn't exist yet.
-# - manual run (Actions -> Release -> Run workflow): builds the current version;
-#   publishes only when "publish" is checked (and the tag doesn't exist).
+# - push a workspace version change to main: build and publish that version.
+# - push a matching v<version> tag: build and publish that exact version.
+# - manual run: build the current version; publishing defaults to enabled.
 name: Release
 
 on:
   push:
     branches: [main]
     paths: [Cargo.toml]
+    tags: ['v*']
   workflow_dispatch:
     inputs:
       publish:
@@ -44,6 +44,8 @@ jobs:
       - id: v
         env:
           EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
           BEFORE: ${{ github.event.before }}
           PUBLISH_INPUT: ${{ inputs.publish }}
         run: |
@@ -57,18 +59,33 @@ jobs:
           if [[ -n "${BEFORE:-}" && ! "$BEFORE" =~ ^0+$ ]] && git cat-file -e "$BEFORE:Cargo.toml" 2>/dev/null; then
             git show "$BEFORE:Cargo.toml" > /tmp/prev.toml && prev=$(ver /tmp/prev.toml)
           fi
+
           tag_exists=false
           git ls-remote --exit-code --tags origin "refs/tags/v$cur" >/dev/null 2>&1 && tag_exists=true
 
           build=false; publish=false
-          if [[ "$EVENT" == "workflow_dispatch" ]]; then
+          if [[ "$EVENT" == "push" && "$REF_TYPE" == "tag" ]]; then
+            # Explicit tag pushes publish exactly the version encoded in the tag.
+            if [[ ! "$REF_NAME" =~ ^v([0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?)$ ]]; then
+              echo "::error::release tag '$REF_NAME' must look like vMAJOR.MINOR.PATCH"; exit 1
+            fi
+            tag_version="${BASH_REMATCH[1]}"
+            if [[ "$cur" != "$tag_version" ]]; then
+              echo "::error::tag v$tag_version does not match [workspace.package] version $cur in Cargo.toml"; exit 1
+            fi
+            build=true; publish=true
+          elif [[ "$EVENT" == "workflow_dispatch" ]]; then
             build=true
-            [[ "$PUBLISH_INPUT" == "true" && "$tag_exists" == "false" ]] && publish=true
+            # Allow a manual publish to refresh assets on an existing release too.
+            [[ "$PUBLISH_INPUT" == "true" ]] && publish=true
           elif [[ "$cur" != "$prev" && "$tag_exists" == "false" ]]; then
+            # A regular `git push origin` after bumping Cargo.toml on main
+            # builds and publishes the new workspace version automatically.
             build=true; publish=true
           fi
           echo "Detected workspace version: $cur"
           echo "Previous workspace version: ${prev:-<none>}"
+          echo "Git ref: $REF_TYPE $REF_NAME"
           echo "Release tag check: v$cur (exists: $tag_exists)"
           echo "Decision: build=$build publish=$publish" | tee -a "$GITHUB_STEP_SUMMARY"
           { echo "version=$cur"; echo "build=$build"; echo "publish=$publish"; } >> "$GITHUB_OUTPUT"
@@ -90,11 +107,16 @@ jobs:
             os: ubuntu-24.04
             features: --features rembg-cli/cuda
             asset: x86_64-linux-cuda
-          # Windows builds always include DirectML (any DirectX 12 GPU) + CPU fallback.
+          # Standard Windows build includes DirectML (any DX12 GPU) + CPU fallback.
           - variant: windows
             os: windows-2025
             features: ""
             asset: x86_64-windows
+          # CUDA is an additional Windows build; DirectML stays compiled as a fallback option.
+          - variant: windows-cuda
+            os: windows-2025
+            features: --features rembg-cli/cuda
+            asset: x86_64-windows-cuda
     defaults:
       run:
         shell: bash
@@ -114,7 +136,7 @@ jobs:
           key: ${{ matrix.variant }}
 
       - name: Test
-        if: matrix.variant != 'linux-cuda'
+        if: matrix.variant != 'linux-cuda' && matrix.variant != 'windows-cuda'
         run: cargo test --workspace --locked
 
       - name: Build
@@ -132,10 +154,32 @@ jobs:
           mkdir -p "$dir"
           cp README.md "$dir/"
           case "$VARIANT" in
-            windows)
+            windows|windows-cuda)
               cp target/release/rembg.exe target/release/rembg-gui.exe "$dir/"
-              # runtime DLLs ort placed next to the exe (e.g. DirectML.dll), if any
+              # Include provider/runtime DLLs copied next to the executables by ort.
               find target/release -maxdepth 1 -iname '*.dll' -exec cp -L {} "$dir/" \;
+              if [[ "$VARIANT" == "windows-cuda" ]]; then
+                for dll in onnxruntime_providers_cuda.dll onnxruntime_providers_shared.dll; do
+                  provider_path=$(find "$dir" -maxdepth 1 -iname "$dll" -print -quit)
+                  if [[ -z "$provider_path" ]]; then
+                    echo "::error::Windows CUDA package is missing $dll"
+                    exit 1
+                  fi
+                done
+                cat > "$dir/WINDOWS-CUDA.txt" <<'EOF'
+          rembg Windows CUDA build
+
+          This build includes the ONNX Runtime CUDA execution provider and DirectML.
+          CUDA is preferred by Auto when available. DirectML can also be selected for
+          supported DirectX 12 GPUs; CPU remains available as a fallback.
+
+          Requires an Ampere-or-newer NVIDIA GPU, an NVIDIA driver >= 580, CUDA 13.x
+          and a compatible cuDNN 9.x runtime. Their DLL directories must be on PATH.
+          CUDA/cuDNN are not bundled in this archive.
+
+          Check compiled providers with: rembg info
+          EOF
+              fi
               (cd dist && 7z a -tzip -mx=9 "$name.zip" "$name" >/dev/null)
               archive="$name.zip"
               ;;
@@ -201,8 +245,14 @@ jobs:
         run: |
           set -euo pipefail
           ls -lh dist
-          gh release create "v$VERSION" dist/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --title "rembg v$VERSION" \
-            --generate-notes
+          tag="v$VERSION"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $tag already exists; updating its assets."
+            gh release upload "$tag" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$tag" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "rembg v$VERSION" \
+              --generate-notes
+          fi

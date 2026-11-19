@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
-use egui::{Color32, RichText, TextureHandle, Vec2, vec2};
+use egui::{Color32, RichText, TextureHandle, vec2};
 use image::RgbaImage;
 use rembg_core::{ModelStore, imageops, registry};
 
@@ -81,6 +81,9 @@ pub struct BatchWindow {
     active: Option<ActiveBatch>,
     waiting_for_model: Option<&'static str>,
     notice: Option<String>,
+    /// Queue and before-preview widths; after-preview receives the remaining space.
+    column_widths: [f32; 2],
+    column_drag_start: Option<(usize, f32)>,
 }
 
 impl BatchWindow {
@@ -102,6 +105,8 @@ impl BatchWindow {
             active: None,
             waiting_for_model: None,
             notice: None,
+            column_widths: [270.0, 300.0],
+            column_drag_start: None,
         }
     }
 
@@ -195,38 +200,61 @@ impl BatchWindow {
         }
 
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.heading("Batch background removal");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add_enabled(!busy && !self.items.is_empty(), egui::Button::new("Clear queue"))
-                    .clicked()
-                {
-                    self.items.clear();
-                    self.selected_item = None;
-                    self.preview = None;
-                    self.notice = None;
-                }
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.heading(RichText::new("Batch background removal").strong());
+                    ui.label(RichText::new("Process a folder or selection into transparent PNGs").weak().small());
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(
+                            !busy && !self.items.is_empty(),
+                            egui::Button::new(RichText::new("Clear queue").size(13.0))
+                                .fill(if ui.visuals().dark_mode {
+                                    Color32::from_rgb(67, 55, 58)
+                                } else {
+                                    Color32::from_rgb(244, 226, 228)
+                                })
+                                .min_size(vec2(104.0, 34.0)),
+                        )
+                        .clicked()
+                    {
+                        self.items.clear();
+                        self.selected_item = None;
+                        self.preview = None;
+                        self.notice = None;
+                    }
+                });
             });
-        });
-        ui.label(RichText::new("Drop images or folders here, or add them below. Results are saved as transparent PNGs.").weak());
-        ui.add_space(8.0);
-
-        ui.horizontal(|ui| {
-            ui.add_enabled_ui(!busy, |ui| {
-                if ui.button("+ Add files…").clicked() {
-                    let files = rfd::FileDialog::new()
-                        .add_filter("Images", IMAGE_EXTENSIONS)
-                        .pick_files()
-                        .unwrap_or_default();
-                    self.add_sources(files);
-                }
-                if ui.button("+ Add folder…").clicked()
-                    && let Some(folder) = rfd::FileDialog::new().pick_folder()
-                {
-                    self.add_sources(vec![folder]);
-                }
-                ui.checkbox(&mut self.recursive, "Include subfolders");
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.add_enabled_ui(!busy, |ui| {
+                    let dark_mode = ui.visuals().dark_mode;
+                    let add_button = |text| {
+                        egui::Button::new(RichText::new(text).strong().size(14.0))
+                            .fill(if dark_mode {
+                                Color32::from_rgb(48, 88, 108)
+                            } else {
+                                Color32::from_rgb(218, 237, 244)
+                            })
+                            .min_size(vec2(128.0, 36.0))
+                    };
+                    if ui.add(add_button("+ Add files…")).clicked() {
+                        let files = rfd::FileDialog::new()
+                            .add_filter("Images", IMAGE_EXTENSIONS)
+                            .pick_files()
+                            .unwrap_or_default();
+                        self.add_sources(files);
+                    }
+                    if ui.add(add_button("+ Add folder…")).clicked()
+                        && let Some(folder) = rfd::FileDialog::new().pick_folder()
+                    {
+                        self.add_sources(vec![folder]);
+                    }
+                    ui.add_space(4.0);
+                    ui.checkbox(&mut self.recursive, "Include subfolders");
+                });
             });
         });
 
@@ -236,12 +264,41 @@ impl BatchWindow {
             if let Some(active) = &self.active {
                 ui.label(RichText::new(format!("{} of {} completed", active.completed, active.total)).weak());
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(RichText::new("Drag the dividers to resize List / Before / After").small().weak());
+            });
         });
 
         let ctx = ui.ctx().clone();
-        ui.columns(2, |columns| {
-            self.show_queue(&mut columns[0], busy);
-            self.show_preview(&mut columns[1], &ctx);
+        let total_width = ui.available_width();
+        let splitter_width = 10.0;
+        let content_width = (total_width - splitter_width * 2.0).max(560.0);
+        let queue_width = self.column_widths[0].clamp(210.0, (content_width - 360.0).max(210.0));
+        let before_width = self.column_widths[1]
+            .clamp(180.0, (content_width - queue_width - 180.0).max(180.0));
+        self.column_widths = [queue_width, before_width];
+        let after_width = (content_width - queue_width - before_width).max(180.0);
+        let content_height = 326.0;
+
+        ui.horizontal(|row| {
+            row.spacing_mut().item_spacing.x = 0.0;
+            row.allocate_ui_with_layout(
+                vec2(queue_width, content_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |column| self.show_queue(column, busy),
+            );
+            self.show_column_splitter(row, 0, content_width, content_height);
+            row.allocate_ui_with_layout(
+                vec2(before_width, content_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |column| self.show_preview_side(column, &ctx, false),
+            );
+            self.show_column_splitter(row, 1, content_width, content_height);
+            row.allocate_ui_with_layout(
+                vec2(after_width, content_height),
+                egui::Layout::top_down(egui::Align::Min),
+                |column| self.show_preview_side(column, &ctx, true),
+            );
         });
 
         ui.add_space(8.0);
@@ -318,13 +375,25 @@ impl BatchWindow {
             if self.active.is_none() && self.waiting_for_model.is_none() {
                 let can_start = !self.items.is_empty() && !self.selected_model.is_empty();
                 if ui
-                    .add_enabled(can_start, egui::Button::new("▶ Start batch").fill(Color32::from_rgb(36, 125, 84)))
+                    .add_enabled(
+                        can_start,
+                        egui::Button::new(RichText::new("▶  Start batch").strong().size(15.0))
+                            .fill(Color32::from_rgb(32, 132, 91))
+                            .min_size(vec2(164.0, 40.0)),
+                    )
                     .clicked()
                 {
                     self.request_start(store, worker);
                 }
             } else if let Some(active) = &self.active {
-                if ui.button("■ Cancel after current image").clicked() {
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("■  Cancel after current image").strong())
+                            .fill(Color32::from_rgb(145, 65, 65))
+                            .min_size(vec2(210.0, 38.0)),
+                    )
+                    .clicked()
+                {
                     active.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                     self.notice = Some("Cancellation requested. The current image will finish first.".into());
                 }
@@ -354,7 +423,7 @@ impl BatchWindow {
             let rect = ui.max_rect();
             let painter = ui.ctx().layer_painter(egui::LayerId::new(
                 egui::Order::Foreground,
-                egui::Id::new("batch-drop-overlay"),
+                ui.id().with("batch-drop-overlay"),
             ));
             painter.rect_filled(rect, 0.0, Color32::from_black_alpha(150));
             painter.text(
@@ -368,10 +437,10 @@ impl BatchWindow {
     }
 
     fn show_queue(&mut self, ui: &mut egui::Ui, busy: bool) {
-        ui.heading("Files");
+        ui.label(RichText::new("File list").strong().size(14.0));
         egui::Frame::group(ui.style()).show(ui, |ui| {
             egui::ScrollArea::vertical()
-                .max_height(285.0)
+                .max_height(286.0)
                 .auto_shrink([false; 2])
                 .show(ui, |ui| {
                     if self.items.is_empty() {
@@ -437,8 +506,58 @@ impl BatchWindow {
         });
     }
 
-    fn show_preview(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        ui.heading("Preview");
+    fn show_column_splitter(
+        &mut self,
+        ui: &mut egui::Ui,
+        column: usize,
+        content_width: f32,
+        height: f32,
+    ) {
+        let (rect, response) = ui.allocate_exact_size(vec2(10.0, height), egui::Sense::click_and_drag());
+        if response.drag_started() {
+            self.column_drag_start = Some((column, self.column_widths[column]));
+        }
+        if response.dragged()
+            && let Some((active_column, start_width)) = self.column_drag_start
+            && active_column == column
+        {
+            let min_width = if column == 0 { 210.0 } else { 180.0 };
+            let max_width = if column == 0 {
+                content_width - 360.0
+            } else {
+                content_width - self.column_widths[0] - 180.0
+            };
+            if let Some(delta) = response.total_drag_delta() {
+                self.column_widths[column] = (start_width + delta.x)
+                    .clamp(min_width, max_width.max(min_width));
+            }
+        }
+        if response.drag_stopped() {
+            self.column_drag_start = None;
+        }
+        if response.hovered() || response.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        }
+
+        let color = if response.dragged() {
+            Color32::from_rgb(55, 158, 190)
+        } else if response.hovered() {
+            Color32::from_rgb(90, 135, 153)
+        } else if ui.visuals().dark_mode {
+            Color32::from_gray(70)
+        } else {
+            Color32::from_gray(190)
+        };
+        let handle = rect.shrink2(vec2(3.0, 8.0));
+        ui.painter().rect_filled(handle, 4.0, color);
+        for offset in [-7.0, 0.0, 7.0] {
+            ui.painter().circle_filled(rect.center() + vec2(0.0, offset), 1.25, Color32::from_white_alpha(180));
+        }
+        response.on_hover_text("Drag to resize this column");
+    }
+
+    fn show_preview_side(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, after: bool) {
+        let title = if after { "After" } else { "Before" };
         let selected = self.selected_item.as_ref().and_then(|path| {
             self.items
                 .iter()
@@ -451,49 +570,34 @@ impl BatchWindow {
                 })
         });
         let Some((key, waiting_for_result)) = selected else {
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.set_min_height(270.0);
-                ui.vertical_centered(|ui| {
-                    ui.add_space(100.0);
-                    ui.label(RichText::new("Select an image to preview it").weak());
-                });
-            });
+            show_preview_tile(
+                ui,
+                title,
+                None,
+                None,
+                "Select an image from the list",
+            );
             return;
         };
 
         self.ensure_preview(ctx, key);
-
-        let (before, after, before_error, after_error, loading) = self.preview.as_ref().map_or(
-            (None, None, None, None, true),
-            |preview| {
-                (
-                    preview.before.as_ref(),
-                    preview.after.as_ref(),
-                    preview.before_error.as_deref(),
-                    preview.after_error.as_deref(),
-                    preview.loading,
-                )
-            },
-        );
-        let after_hint = if loading {
-            "Loading preview…"
-        } else if waiting_for_result {
-            "Result will appear after processing"
-        } else {
-            "No output available"
-        };
-
-        let before_hint = if loading { "Loading preview…" } else { "Could not load source image" };
-        ui.columns(2, |columns| {
-            show_preview_tile(&mut columns[0], "Before", before, before_error, before_hint);
-            show_preview_tile(
-                &mut columns[1],
-                "After",
-                after,
-                after_error,
-                after_hint,
-            );
+        let (image, error, loading) = self.preview.as_ref().map_or((None, None, true), |preview| {
+            if after {
+                (preview.after.as_ref(), preview.after_error.as_deref(), preview.loading)
+            } else {
+                (preview.before.as_ref(), preview.before_error.as_deref(), preview.loading)
+            }
         });
+        let placeholder = if loading {
+            "Loading preview…"
+        } else if after && waiting_for_result {
+            "Result appears after processing"
+        } else if after {
+            "No output available"
+        } else {
+            "Could not load source image"
+        };
+        show_preview_tile(ui, title, image, error, placeholder);
     }
 
     fn ensure_preview(&mut self, ctx: &egui::Context, key: PreviewKey) {
@@ -695,9 +799,14 @@ fn show_preview_tile(
     placeholder: &str,
 ) {
     egui::Frame::group(ui.style()).show(ui, |ui| {
-        ui.set_min_height(252.0);
+        ui.set_min_height(300.0);
         ui.vertical_centered(|ui| {
-            ui.label(RichText::new(title).strong());
+            let title_color = match title {
+                "Before" => Color32::from_rgb(93, 165, 194),
+                "After" => Color32::from_rgb(92, 180, 132),
+                _ => ui.visuals().text_color(),
+            };
+            ui.label(RichText::new(title).strong().size(15.0).color(title_color));
             ui.add_space(5.0);
             if let Some(image) = image {
                 let available = ui.available_size();
