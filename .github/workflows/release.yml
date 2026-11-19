@@ -48,7 +48,7 @@ jobs:
           PUBLISH_INPUT: ${{ inputs.publish }}
         run: |
           set -euo pipefail
-          ver() { sed -n '/^\[workspace\.package\]/,/^\[/{s/^version *= *"\([^"]*\)".*/\1/p}' "$1"; }
+          ver() { awk '/^\[workspace\.package\]$/{in_section=1; next} /^\[/{in_section=0} in_section && /^version[[:space:]]*=/ {gsub(/[[:space:]]/, "", $0); sub(/^version=\"/, "", $0); sub(/\"$/, "", $0); print; exit}' "$1"; }
           cur=$(ver Cargo.toml)
           if ! [[ "$cur" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
             echo "::error::could not read a semver [workspace.package] version from Cargo.toml (got '$cur')"; exit 1
@@ -67,7 +67,10 @@ jobs:
           elif [[ "$cur" != "$prev" && "$tag_exists" == "false" ]]; then
             build=true; publish=true
           fi
-          echo "version: ${prev:-<none>} -> $cur (tag v$cur exists: $tag_exists) => build=$build publish=$publish" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "Detected workspace version: $cur"
+          echo "Previous workspace version: ${prev:-<none>}"
+          echo "Release tag check: v$cur (exists: $tag_exists)"
+          echo "Decision: build=$build publish=$publish" | tee -a "$GITHUB_STEP_SUMMARY"
           { echo "version=$cur"; echo "build=$build"; echo "publish=$publish"; } >> "$GITHUB_OUTPUT"
 
   build:
